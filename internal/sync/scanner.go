@@ -7,11 +7,15 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/daniel/gcrypt/internal/models"
+	"golang.org/x/sync/errgroup"
 )
+
 
 // Scanner performs full and single-file directory scans, producing
 // SyncFile records with SHA-256 content hashes for change detection.
@@ -38,6 +42,10 @@ func NewScanner(dir string, ignorePatterns []string, selectedFolders []string) *
 // a SyncFile entry for every non-ignored file found.
 func (s *Scanner) Scan() ([]*models.SyncFile, error) {
 	var files []*models.SyncFile
+	var mu sync.Mutex
+
+	g := new(errgroup.Group)
+	g.SetLimit(runtime.NumCPU() * 2)
 
 	err := filepath.WalkDir(s.dir, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -115,18 +123,29 @@ func (s *Scanner) Scan() ([]*models.SyncFile, error) {
 			return nil
 		}
 
-		sf, err := s.buildSyncFile(path, info)
-		if err != nil {
-			// Skip files we cannot hash (e.g. locked by another process).
-			return nil
-		}
+		// Schedule file hashing and struct building on the worker pool.
+		g.Go(func() error {
+			sf, err := s.buildSyncFile(path, info)
+			if err != nil {
+				// Skip files we cannot hash (e.g. locked by another process).
+				return nil
+			}
 
-		files = append(files, sf)
+			mu.Lock()
+			files = append(files, sf)
+			mu.Unlock()
+			return nil
+		})
+
 		return nil
 	})
 
 	if err != nil {
-		return nil, fmt.Errorf("scan directory: %w", err)
+		return nil, fmt.Errorf("scan directory walk: %w", err)
+	}
+
+	if err := g.Wait(); err != nil {
+		return nil, fmt.Errorf("scan directory process: %w", err)
 	}
 
 	return files, nil

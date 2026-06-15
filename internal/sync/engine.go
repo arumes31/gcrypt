@@ -551,7 +551,7 @@ func (e *Engine) Activity() SyncActivity {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	act := SyncActivity{
-		Pending: len(e.workQueue),
+		Pending: int(atomic.LoadInt64(&e.pendingOps)),
 		Active:  len(e.activeOps),
 	}
 	if len(e.activeOps) > 0 {

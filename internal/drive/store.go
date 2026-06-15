@@ -71,10 +71,18 @@ func NewStore(dbPath string, defaultRootID string) (*Store, error) {
 		return nil, fmt.Errorf("store: failed to open database: %w", err)
 	}
 
-	// Enable foreign keys so ON DELETE CASCADE works.
+	// Enable foreign keys and optimize performance with WAL mode.
 	if _, err := db.Exec("PRAGMA foreign_keys = ON"); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("store: failed to enable foreign keys: %w", err)
+	}
+	if _, err := db.Exec("PRAGMA journal_mode = WAL"); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("store: failed to enable WAL mode: %w", err)
+	}
+	if _, err := db.Exec("PRAGMA synchronous = NORMAL"); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("store: failed to set synchronous: %w", err)
 	}
 
 	// Apply V2 schema (CREATE IF NOT EXISTS is idempotent for new databases).
