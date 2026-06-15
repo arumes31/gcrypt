@@ -401,7 +401,7 @@ func migrateV1(path string, data []byte) (*Config, error) {
 
 	// Create backup of the original V1 file.
 	backupPath := path + ".v1.bak"
-	if err := os.WriteFile(backupPath, data, 0644); err != nil {
+	if err := os.WriteFile(backupPath, data, 0600); err != nil {
 		return nil, fmt.Errorf("creating V1 backup: %w", err)
 	}
 
@@ -458,18 +458,9 @@ func applyDefaults(cfg *Config) {
 	}
 
 	// Apply SyncPair-level defaults.
-	for i := range cfg.SyncPairs {
-		p := &cfg.SyncPairs[i]
-		if !p.Enabled {
-			// Enabled is false by default in Go; set to true only if it was
-			// the zero-value (we can't distinguish false from unset in YAML
-			// without a pointer, so we rely on the fact that a newly created
-			// pair should default to enabled). We use a simple heuristic: if
-			// the pair has a LocalDir but Enabled is false and ID is empty,
-			// it was likely just deserialized without the field. However, the
-			// YAML spec says false is a valid value, so we respect it.
-			// The AddSyncPair method always sets Enabled=true explicitly.
-		}
+	for range cfg.SyncPairs {
+		// Enabled is false by default in Go; the AddSyncPair method always
+		// sets Enabled=true explicitly. We respect the deserialized value.
 	}
 }
 
@@ -490,7 +481,7 @@ func ensurePairIDs(cfg *Config) {
 // It creates the parent directories if they do not exist.
 func Save(path string, cfg *Config) error {
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0750); err != nil {
 		return fmt.Errorf("creating config directory: %w", err)
 	}
 
@@ -499,7 +490,7 @@ func Save(path string, cfg *Config) error {
 		return fmt.Errorf("marshaling config: %w", err)
 	}
 
-	if err := os.WriteFile(path, data, 0644); err != nil {
+	if err := os.WriteFile(path, data, 0600); err != nil {
 		return fmt.Errorf("writing config file: %w", err)
 	}
 

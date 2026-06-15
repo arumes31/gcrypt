@@ -35,6 +35,6 @@ func hideConsoleIfOwned() {
 	n, _, _ := getConsoleProcessList.Call(uintptr(unsafe.Pointer(&pids[0])), uintptr(len(pids)))
 	if int(n) == 1 {
 		const swHide = 0
-		showWindow.Call(hwnd, swHide)
+		_, _, _ = showWindow.Call(hwnd, swHide)
 	}
 }

@@ -66,7 +66,7 @@ func protectData(plaintext []byte) ([]byte, error) {
 	if ret == 0 {
 		return nil, fmt.Errorf("service: CryptProtectData failed: %w", err)
 	}
-	defer procLocalFree.Call(uintptr(unsafe.Pointer(out.pbData)))
+	defer func() { _, _, _ = procLocalFree.Call(uintptr(unsafe.Pointer(out.pbData))) }()
 
 	return out.bytes(), nil
 }
@@ -89,7 +89,7 @@ func unprotectData(ciphertext []byte) ([]byte, error) {
 	if ret == 0 {
 		return nil, fmt.Errorf("service: CryptUnprotectData failed: %w", err)
 	}
-	defer procLocalFree.Call(uintptr(unsafe.Pointer(out.pbData)))
+	defer func() { _, _, _ = procLocalFree.Call(uintptr(unsafe.Pointer(out.pbData))) }()
 
 	return out.bytes(), nil
 }

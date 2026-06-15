@@ -972,7 +972,7 @@ func (t *TrayApp) handlePairRemoveConfirm(pairID string) {
 	cfg := t.ctrl.Config()
 	if cfg != nil {
 		cfg.RemoveSyncPair(pairID)
-		config.Save(config.ConfigPath(), cfg)
+		_ = config.Save(config.ConfigPath(), cfg)
 	}
 
 	// Refresh the pair slots to reflect the removal.
@@ -1476,7 +1476,7 @@ func (t *TrayApp) handleAutoStartLoop() {
 				fmt.Fprintf(os.Stderr, "service: disable autostart: %v\n", err)
 			}
 		}
-		config.Save(config.ConfigPath(), cfg)
+		_ = config.Save(config.ConfigPath(), cfg)
 		t.mu.Unlock()
 	}
 }
@@ -1535,7 +1535,7 @@ func (t *TrayApp) handleStartMinimizedLoop() {
 		} else {
 			t.mStartMinimized.Uncheck()
 		}
-		config.Save(config.ConfigPath(), cfg)
+		_ = config.Save(config.ConfigPath(), cfg)
 		t.mu.Unlock()
 	}
 }
@@ -1553,7 +1553,7 @@ func (t *TrayApp) handleSyncInterval(secs int) {
 	for i := range cfg.SyncPairs {
 		cfg.SyncPairs[i].SyncInterval = secs
 	}
-	config.Save(config.ConfigPath(), cfg)
+	_ = config.Save(config.ConfigPath(), cfg)
 	// TODO: notify engines of interval change (could restart poller)
 }
 
@@ -1568,7 +1568,7 @@ func (t *TrayApp) handleMaxFileSize(mib int64) {
 	}
 
 	cfg.App.MaxFileSize = mib * 1024 * 1024 // MiB to bytes
-	config.Save(config.ConfigPath(), cfg)
+	_ = config.Save(config.ConfigPath(), cfg)
 }
 
 // handleUploadLimit updates the upload bandwidth limit (KB/s, 0 = unlimited)
@@ -1614,7 +1614,7 @@ func (t *TrayApp) handleLogLevel(level string) {
 	}
 
 	cfg.App.LogLevel = level
-	config.Save(config.ConfigPath(), cfg)
+	_ = config.Save(config.ConfigPath(), cfg)
 	// Note: runtime log level change would need a method on the logger.
 	// This is a config-only change for now; it takes effect on restart.
 }
@@ -1633,7 +1633,7 @@ func (t *TrayApp) handleLogMaxSize(mib int) {
 	if t.logger != nil {
 		t.logger.SetMaxSize(int64(mib) * 1024 * 1024)
 	}
-	config.Save(config.ConfigPath(), cfg)
+	_ = config.Save(config.ConfigPath(), cfg)
 }
 
 // handleLogMaxBackups updates the log backups setting and applies it at runtime.
@@ -1650,7 +1650,7 @@ func (t *TrayApp) handleLogMaxBackups(n int) {
 	if t.logger != nil {
 		t.logger.SetMaxBackups(n)
 	}
-	config.Save(config.ConfigPath(), cfg)
+	_ = config.Save(config.ConfigPath(), cfg)
 }
 
 // ---------------------------------------------------------------------------

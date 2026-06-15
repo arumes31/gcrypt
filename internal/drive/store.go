@@ -73,13 +73,13 @@ func NewStore(dbPath string, defaultRootID string) (*Store, error) {
 
 	// Enable foreign keys so ON DELETE CASCADE works.
 	if _, err := db.Exec("PRAGMA foreign_keys = ON"); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("store: failed to enable foreign keys: %w", err)
 	}
 
 	// Apply V2 schema (CREATE IF NOT EXISTS is idempotent for new databases).
 	if _, err := db.Exec(schemaV2); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("store: failed to apply schema: %w", err)
 	}
 
@@ -100,7 +100,7 @@ func NewStore(dbPath string, defaultRootID string) (*Store, error) {
 			defaultRootID = uuid.New().String()
 		}
 		if err := migrateV1ToV2(db, defaultRootID); err != nil {
-			db.Close()
+			_ = db.Close()
 			return nil, fmt.Errorf("store: migrating database: %w", err)
 		}
 	}
@@ -116,7 +116,7 @@ func migrateV1ToV2(db *sql.DB, defaultRootID string) error {
 	if err != nil {
 		return fmt.Errorf("begin migration transaction: %w", err)
 	}
-	defer tx.Rollback() // no-op if committed
+	defer func() { _ = tx.Rollback() }() // no-op if committed
 
 	// 1. Create schema_version and sync_roots tables (idempotent).
 	if _, err := tx.Exec(`
@@ -347,7 +347,7 @@ func (s *Store) ListPending(syncRootID string) ([]*models.SyncFile, error) {
 	if err != nil {
 		return nil, fmt.Errorf("store: list pending: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	return scanSyncFiles(rows)
 }
@@ -369,7 +369,7 @@ func (s *Store) ListAll(syncRootID string) ([]*models.SyncFile, error) {
 	if err != nil {
 		return nil, fmt.Errorf("store: list all: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	return scanSyncFiles(rows)
 }
@@ -481,7 +481,7 @@ func (s *Store) ListSyncRoots() ([]*models.SyncRoot, error) {
 	if err != nil {
 		return nil, fmt.Errorf("store: list sync roots: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var roots []*models.SyncRoot
 	for rows.Next() {

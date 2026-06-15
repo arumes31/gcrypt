@@ -150,7 +150,7 @@ func pickFolder(title string) (string, bool) {
 	if pidl == 0 {
 		return "", false
 	}
-	defer pCoTaskMemFreeDlg.Call(pidl)
+	defer func() { _, _, _ = pCoTaskMemFreeDlg.Call(pidl) }()
 
 	pathBuf := make([]uint16, 260)
 	ret, _, _ := pSHGetPathFromIDLst.Call(pidl, uintptr(unsafe.Pointer(&pathBuf[0])))
@@ -195,7 +195,7 @@ func registerTextDlgClass() {
 			lpszClassName: textDlgClassName,
 		}
 		wc.cbSize = uint32(unsafe.Sizeof(wc))
-		pRegisterClassExDlg.Call(uintptr(unsafe.Pointer(&wc)))
+		_, _, _ = pRegisterClassExDlg.Call(uintptr(unsafe.Pointer(&wc)))
 	})
 }
 
@@ -209,17 +209,19 @@ func textDlgProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 				curTextDlg.result = getControlText(curTextDlg.editHwnd)
 				curTextDlg.ok = true
 			}
-			pPostMessageDlg.Call(hwnd, wmClose, 0, 0)
+			_, _, _ = pPostMessageDlg.Call(hwnd, wmClose, 0, 0)
+
 			return 0
 		case idCancel:
-			pPostMessageDlg.Call(hwnd, wmClose, 0, 0)
+			_, _, _ = pPostMessageDlg.Call(hwnd, wmClose, 0, 0)
+
 			return 0
 		}
 	case wmClose:
-		pDestroyWindowDlg.Call(hwnd)
+		_, _, _ = pDestroyWindowDlg.Call(hwnd)
 		return 0
 	case wmDestroy:
-		pPostQuitDlg.Call(0)
+		_, _, _ = pPostQuitDlg.Call(0)
 		return 0
 	}
 	r, _, _ := pDefWindowProcDlg.Call(hwnd, msg, wParam, lParam)
@@ -233,7 +235,7 @@ func getControlText(hwnd uintptr) string {
 		return ""
 	}
 	buf := make([]uint16, length+1)
-	pGetWindowTextDlg.Call(hwnd, uintptr(unsafe.Pointer(&buf[0])), uintptr(length+1))
+	_, _, _ = pGetWindowTextDlg.Call(hwnd, uintptr(unsafe.Pointer(&buf[0])), uintptr(length+1))
 	return syscall.UTF16ToString(buf)
 }
 
@@ -252,7 +254,7 @@ func createControl(class, text string, style uint32, x, y, w, h int, parent uint
 		0,
 	)
 	if font != 0 {
-		pSendMessageDlg.Call(hwnd, wmSetFont, font, 1)
+		_, _, _ = pSendMessageDlg.Call(hwnd, wmSetFont, font, 1)
 	}
 	return hwnd
 }
@@ -305,8 +307,8 @@ func promptText(title, label, initial string, password bool) (string, bool) {
 	createControl("BUTTON", "OK", wsChild|wsVisible|wsTabStop|bsDefPush, width-200, 100, 85, 28, hwnd, idOK, font)
 	createControl("BUTTON", "Cancel", wsChild|wsVisible|wsTabStop|bsPush, width-105, 100, 85, 28, hwnd, idCancel, font)
 
-	pShowWindowDlg.Call(hwnd, swShow)
-	pSetForegroundDlg.Call(hwnd)
+	_, _, _ = pShowWindowDlg.Call(hwnd, swShow)
+	_, _, _ = pSetForegroundDlg.Call(hwnd)
 
 	// Modal message loop.
 	var msg msgDlg
@@ -318,8 +320,8 @@ func promptText(title, label, initial string, password bool) (string, bool) {
 		// Let the dialog manager handle Tab/Enter/Esc navigation.
 		handled, _, _ := pIsDialogMessageDlg.Call(hwnd, uintptr(unsafe.Pointer(&msg)))
 		if handled == 0 {
-			pTranslateMsgDlg.Call(uintptr(unsafe.Pointer(&msg)))
-			pDispatchMsgDlg.Call(uintptr(unsafe.Pointer(&msg)))
+			_, _, _ = pTranslateMsgDlg.Call(uintptr(unsafe.Pointer(&msg)))
+			_, _, _ = pDispatchMsgDlg.Call(uintptr(unsafe.Pointer(&msg)))
 		}
 	}
 

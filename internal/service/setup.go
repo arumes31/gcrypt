@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -30,7 +31,7 @@ func RunSetup(ctrl *AppController, logger *Logger) error {
 		// Fall back to a sensible default if the picker was dismissed.
 		syncDir = filepath.Join(os.Getenv("USERPROFILE"), "gcrypt")
 	}
-	if err := os.MkdirAll(syncDir, 0755); err != nil {
+	if err := os.MkdirAll(syncDir, 0750); err != nil {
 		messageBox("gcrypt setup", fmt.Sprintf("Could not create sync folder:\n%v", err), mbOK|mbIconError)
 		return fmt.Errorf("service: creating sync dir: %w", err)
 	}
@@ -66,12 +67,14 @@ func RunSetup(ctrl *AppController, logger *Logger) error {
 		return fmt.Errorf("service: generating salt: %w", err)
 	}
 	saltPath := filepath.Join(appDataDir(), "gcrypt", "salt.bin")
-	if err := os.MkdirAll(filepath.Dir(saltPath), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(saltPath), 0750); err != nil {
 		return fmt.Errorf("service: creating salt dir: %w", err)
 	}
+
 	if err := os.WriteFile(saltPath, salt, 0600); err != nil {
 		return fmt.Errorf("service: saving salt: %w", err)
 	}
+
 	masterKey, err := crypto.DeriveMasterKey(passphrase, salt)
 	if err != nil {
 		return fmt.Errorf("service: deriving master key: %w", err)
@@ -124,11 +127,11 @@ func RunSetup(ctrl *AppController, logger *Logger) error {
 	if !ok || strings.TrimSpace(folderName) == "" {
 		folderName = "gcrypt"
 	}
-	driveClient, err := drive.NewClient(nil, oauthCfg, token, "root")
+	driveClient, err := drive.NewClient(context.TODO(), oauthCfg, token, "root")
 	if err != nil {
 		return fmt.Errorf("service: creating Drive client: %w", err)
 	}
-	folderID, err := driveClient.EnsureFolder(nil, strings.TrimSpace(folderName))
+	folderID, err := driveClient.EnsureFolder(context.TODO(), strings.TrimSpace(folderName))
 	if err != nil {
 		messageBox("gcrypt setup", fmt.Sprintf("Could not create Drive folder:\n%v", err), mbOK|mbIconError)
 		return fmt.Errorf("service: ensure folder: %w", err)

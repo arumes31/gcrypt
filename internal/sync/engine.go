@@ -928,7 +928,7 @@ func (e *Engine) downloadFile(sf *models.SyncFile) error {
 	if err != nil {
 		return fmt.Errorf("sync: download %s: %w", sf.LocalPath, err)
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 
 	// 2. Read all content from the ReadCloser.
 	ciphertext, err := io.ReadAll(rc)
@@ -947,13 +947,14 @@ func (e *Engine) downloadFile(sf *models.SyncFile) error {
 
 	// 5. Write plaintext to local file path (create parent dirs if needed).
 	localPath := filepath.Join(e.pair.LocalDir, sf.LocalPath)
-	if err := os.MkdirAll(filepath.Dir(localPath), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(localPath), 0750); err != nil {
 		crypto.WipeBytes(plaintext)
-		return fmt.Errorf("sync: create parent dirs for %s: %w", localPath, err)
+		return fmt.Errorf("sync: creating directory for %s: %w", sf.LocalPath, err)
 	}
-	if err := os.WriteFile(localPath, plaintext, 0644); err != nil {
+
+	if err := os.WriteFile(localPath, plaintext, 0600); err != nil {
 		crypto.WipeBytes(plaintext)
-		return fmt.Errorf("sync: write local file %s: %w", localPath, err)
+		return fmt.Errorf("sync: writing %s: %w", sf.LocalPath, err)
 	}
 
 	// 6. Update store: set local hash, update status to synced.
@@ -1063,9 +1064,8 @@ func (e *Engine) resolveConflict(sf *models.SyncFile) error {
 		// Save current local file as a conflict backup.
 		backupPath := fmt.Sprintf("%s.conflict.%s", localPath, time.Now().Format("20060102-150405"))
 		if data, err := os.ReadFile(localPath); err == nil {
-			_ = os.WriteFile(backupPath, data, 0644)
+			_ = os.WriteFile(backupPath, data, 0600)
 		}
-
 		// Download the remote version.
 		return e.downloadFile(sf)
 	}

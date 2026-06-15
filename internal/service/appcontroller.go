@@ -258,9 +258,10 @@ func (ac *AppController) HandlePassphrase() error {
 		if err != nil {
 			return fmt.Errorf("service: generating salt: %w", err)
 		}
-		if err := os.MkdirAll(filepath.Dir(saltPath), 0755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(saltPath), 0750); err != nil {
 			return fmt.Errorf("service: creating salt directory: %w", err)
 		}
+
 		if err := os.WriteFile(saltPath, salt, 0600); err != nil {
 			return fmt.Errorf("service: saving salt: %w", err)
 		}
@@ -314,7 +315,7 @@ func (ac *AppController) activateMasterKey(masterKey, salt []byte) error {
 	ac.mu.Lock()
 	if ac.masterKey != nil {
 		crypto.WipeBytes(ac.masterKey)
-		crypto.UnlockMemory(ac.masterKey)
+		_ = crypto.UnlockMemory(ac.masterKey)
 	}
 	ac.masterKey = masterKey
 	ac.salt = salt
@@ -780,7 +781,7 @@ func (ac *AppController) Shutdown() {
 	// Wipe and unlock the master key from memory.
 	ac.mu.Lock()
 	if ac.masterKey != nil {
-		crypto.UnlockMemory(ac.masterKey)
+		_ = crypto.UnlockMemory(ac.masterKey)
 		crypto.WipeBytes(ac.masterKey)
 		ac.masterKey = nil
 	}

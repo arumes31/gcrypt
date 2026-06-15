@@ -164,7 +164,7 @@ func TestV1Migration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal V1 config: %v", err)
 	}
-	if err := os.WriteFile(configPath, data, 0644); err != nil {
+	if err := os.WriteFile(configPath, data, 0600); err != nil {
 		t.Fatalf("write V1 config: %v", err)
 	}
 
@@ -247,7 +247,7 @@ sync_interval: 30
 log_path: /test/log.log
 auto_start: false
 `
-	if err := os.WriteFile(configPath, []byte(v1YAML), 0644); err != nil {
+	if err := os.WriteFile(configPath, []byte(v1YAML), 0600); err != nil {
 		t.Fatalf("write V1 config: %v", err)
 	}
 
@@ -288,7 +288,7 @@ sync_pairs:
 encryption:
   passphrase_hash: "somehash"
 `
-	if err := os.WriteFile(configPath, []byte(minimalYAML), 0644); err != nil {
+	if err := os.WriteFile(configPath, []byte(minimalYAML), 0600); err != nil {
 		t.Fatalf("write minimal config: %v", err)
 	}
 
@@ -329,7 +329,7 @@ sync_pairs:
 encryption:
   passphrase_hash: "somehash"
 `
-	if err := os.WriteFile(configPath, []byte(yamlContent), 0644); err != nil {
+	if err := os.WriteFile(configPath, []byte(yamlContent), 0600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
 

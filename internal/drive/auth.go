@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"time"
 
 	"github.com/daniel/gcrypt/internal/crypto"
 	"golang.org/x/oauth2"
@@ -112,9 +113,11 @@ func GetTokenFromWeb(config *oauth2.Config) (*oauth2.Token, error) {
 			return
 		}
 
-		fmt.Fprintln(w, "Authorization successful! You can close this tab.")
+		_, _ = fmt.Fprintln(w, "Authorization successful! You can close this tab.")
 		codeCh <- code
 	})
+
+	srv.ReadHeaderTimeout = 10 * time.Second
 
 	go func() {
 		if err := srv.Serve(listener); err != nil && err != http.ErrServerClosed {
@@ -194,9 +197,11 @@ func GetTokenFromWebBrowser(config *oauth2.Config) (*oauth2.Token, error) {
 			return
 		}
 
-		fmt.Fprintln(w, "Authorization successful! You can close this tab.")
+		_, _ = fmt.Fprintln(w, "Authorization successful! You can close this tab.")
 		codeCh <- code
 	})
+
+	srv.ReadHeaderTimeout = 10 * time.Second
 
 	go func() {
 		if err := srv.Serve(listener); err != nil && err != http.ErrServerClosed {
@@ -266,7 +271,7 @@ func SaveToken(path string, token *oauth2.Token, masterKey []byte) error {
 
 	// Create parent directories if needed.
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0750); err != nil {
 		return fmt.Errorf("drive: failed to create token directory: %w", err)
 	}
 

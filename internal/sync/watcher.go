@@ -205,7 +205,7 @@ func (w *Watcher) readDirectoryChanges(dir string) {
 	if err != nil {
 		return
 	}
-	defer windows.CloseHandle(handle)
+	defer func() { _ = windows.CloseHandle(handle) }()
 
 	// Allocate the notification buffer.
 	buf := make([]byte, w.bufferSize)
@@ -217,7 +217,7 @@ func (w *Watcher) readDirectoryChanges(dir string) {
 	if err != nil {
 		return
 	}
-	defer windows.CloseHandle(overlapped.HEvent)
+	defer func() { _ = windows.CloseHandle(overlapped.HEvent) }()
 
 	for {
 		// Issue the asynchronous ReadDirectoryChanges call.
@@ -258,7 +258,7 @@ func (w *Watcher) readDirectoryChanges(dir string) {
 		err = windows.GetOverlappedResult(handle, &overlapped, &bytesTransferred, false)
 		if err != nil || bytesTransferred == 0 {
 			// Reset the overlapped event for the next call.
-			windows.ResetEvent(overlapped.HEvent)
+			_ = windows.ResetEvent(overlapped.HEvent)
 			continue
 		}
 
@@ -266,7 +266,7 @@ func (w *Watcher) readDirectoryChanges(dir string) {
 		w.parseNotifyBuffer(buf[:bytesTransferred], dir)
 
 		// Reset the overlapped event for the next call.
-		windows.ResetEvent(overlapped.HEvent)
+		_ = windows.ResetEvent(overlapped.HEvent)
 	}
 }
 
@@ -472,7 +472,7 @@ func (w *Watcher) shouldIgnore(relPath string) bool {
 func (w *Watcher) walkSubdirs() []string {
 	var dirs []string
 
-	filepath.WalkDir(w.dir, func(path string, d os.DirEntry, err error) error {
+	_ = filepath.WalkDir(w.dir, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			if os.IsPermission(err) && d != nil && d.IsDir() {
 				return filepath.SkipDir

@@ -127,7 +127,7 @@ build/
 # Another comment
 *.bak
 `
-	if err := os.WriteFile(ignorePath, []byte(content), 0644); err != nil {
+	if err := os.WriteFile(ignorePath, []byte(content), 0600); err != nil {
 		t.Fatalf("failed to write ignore file: %v", err)
 	}
 

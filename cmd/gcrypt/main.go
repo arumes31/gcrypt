@@ -78,7 +78,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "error creating logger: %v\n", err)
 		os.Exit(1)
 	}
-	defer logger.Close()
+	defer func() { _ = logger.Close() }()
 
 	logger.Info("gcrypt starting", map[string]interface{}{
 		"version": Version,

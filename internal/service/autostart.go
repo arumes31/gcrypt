@@ -25,7 +25,7 @@ func EnableAutoStart() error {
 	if err != nil {
 		return fmt.Errorf("service: open registry key: %w", err)
 	}
-	defer key.Close()
+	defer func() { _ = key.Close() }()
 
 	if err := key.SetStringValue(autostartValueName, exePath); err != nil {
 		return fmt.Errorf("service: set registry value: %w", err)
@@ -41,7 +41,7 @@ func DisableAutoStart() error {
 	if err != nil {
 		return fmt.Errorf("service: open registry key: %w", err)
 	}
-	defer key.Close()
+	defer func() { _ = key.Close() }()
 
 	if err := key.DeleteValue(autostartValueName); err != nil {
 		return fmt.Errorf("service: delete registry value: %w", err)
@@ -57,7 +57,7 @@ func IsAutoStartEnabled() (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("service: open registry key: %w", err)
 	}
-	defer key.Close()
+	defer func() { _ = key.Close() }()
 
 	_, _, err = key.GetStringValue(autostartValueName)
 	if err != nil {

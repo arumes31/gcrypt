@@ -24,12 +24,14 @@ func saveRememberedKey(masterKey []byte) error {
 		return err
 	}
 	path := rememberedKeyPath()
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0750); err != nil {
 		return fmt.Errorf("service: creating remember dir: %w", err)
 	}
+
 	if err := os.WriteFile(path, protected, 0600); err != nil {
 		return fmt.Errorf("service: writing remembered key: %w", err)
 	}
+
 	return nil
 }
 

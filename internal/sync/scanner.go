@@ -185,7 +185,7 @@ func (s *Scanner) ComputeHash(path string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("open for hash: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	h := sha256.New()
 	buf := make([]byte, 32*1024) // 32 KB chunks

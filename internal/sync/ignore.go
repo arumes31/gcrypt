@@ -226,7 +226,7 @@ func LoadIgnoreFile(path string) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open ignore file: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	var patterns []string
 	scanner := bufio.NewScanner(f)

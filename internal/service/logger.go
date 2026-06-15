@@ -46,11 +46,11 @@ type Logger struct {
 // directories are created automatically if they do not exist.
 func NewLogger(path string) (*Logger, error) {
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0750); err != nil {
 		return nil, fmt.Errorf("service: create log directory: %w", err)
 	}
 
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
 		return nil, fmt.Errorf("service: open log file: %w", err)
 	}
@@ -206,7 +206,7 @@ func (l *Logger) rotate() error {
 	_ = os.Rename(l.path, fmt.Sprintf("%s.1", l.path))
 
 	// Open a fresh log file.
-	f, err := os.OpenFile(l.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	f, err := os.OpenFile(l.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
 		return fmt.Errorf("service: open new log file after rotation: %w", err)
 	}
