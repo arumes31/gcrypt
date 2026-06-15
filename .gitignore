@@ -1,0 +1,53 @@
+# Go build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.pdb
+*.syso
+/build/
+/dist/
+bin/
+
+# Dependencies
+vendor/
+
+# Configuration and Sensitive Data
+# These should NOT be committed to the repo
+config.yaml
+config.yaml.bak
+tokens.enc
+.env
+.env.*
+
+# Local Databases and State
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+.gcrypt-state/
+
+# Logs
+*.log
+logs/
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.swp
+*~
+*.bak
+
+# OS specific files
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Test coverage
+coverage.txt
+coverage.out
+
+# Documentation
+*.md
+!README.md

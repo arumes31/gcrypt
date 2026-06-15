@@ -1,0 +1,34 @@
+# Binary artifacts
+example/example
+example/main
+webview_example/webview_example
+webview_example/main
+**/*.exe
+*.dll
+*.so
+*.dylib
+*.pdb
+*.syso
+
+# Build directories
+Release/
+Debug/
+out/
+bin/
+
+# IDEs and Temporary files
+.vs/
+.vscode/
+*.sdf
+*.suo
+*.user
+*.sln
+*~
+*.swp
+*.bak
+on_exit*.txt
+out.txt
+
+# OS specific
+.DS_Store
+Thumbs.db
