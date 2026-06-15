@@ -6,9 +6,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/daniel/gcrypt/internal/appstate"
-	"github.com/daniel/gcrypt/internal/config"
-	"github.com/daniel/gcrypt/internal/drive"
+	"github.com/arumes31/gcrypt/internal/appstate"
+	"github.com/arumes31/gcrypt/internal/config"
+	"github.com/arumes31/gcrypt/internal/drive"
 )
 
 // ---------------------------------------------------------------------------

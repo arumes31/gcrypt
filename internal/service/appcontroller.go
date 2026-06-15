@@ -11,12 +11,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/daniel/gcrypt/internal/appstate"
-	"github.com/daniel/gcrypt/internal/config"
-	"github.com/daniel/gcrypt/internal/crypto"
-	"github.com/daniel/gcrypt/internal/drive"
-	"github.com/daniel/gcrypt/internal/models"
-	syncpkg "github.com/daniel/gcrypt/internal/sync"
+	"github.com/arumes31/gcrypt/internal/appstate"
+	"github.com/arumes31/gcrypt/internal/config"
+	"github.com/arumes31/gcrypt/internal/crypto"
+	"github.com/arumes31/gcrypt/internal/drive"
+	"github.com/arumes31/gcrypt/internal/models"
+	syncpkg "github.com/arumes31/gcrypt/internal/sync"
 
 	"golang.org/x/oauth2"
 )

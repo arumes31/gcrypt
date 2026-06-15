@@ -10,7 +10,7 @@ import (
 	"unicode/utf16"
 	"unsafe"
 
-	"github.com/daniel/gcrypt/internal/models"
+	"github.com/arumes31/gcrypt/internal/models"
 	"golang.org/x/sys/windows"
 )
 
@@ -132,22 +132,16 @@ func (w *Watcher) Start() error {
 	w.wg.Add(1)
 	go w.processDebouncedEvents()
 
-	// Start the main watch loop for the root directory.
+	// Start the main watch loop for the root directory. A single handle opened
+	// with bWatchSubtree=TRUE covers the entire tree — including subdirectories
+	// created after Start — so no per-subdirectory watchers are needed. Spawning
+	// one watcher per subdirectory (as a previous version did) wasted a handle,
+	// goroutine and 64 KB buffer per directory and produced duplicate events.
 	w.wg.Add(1)
 	go func() {
 		defer w.wg.Done()
 		w.readDirectoryChanges(w.dir)
 	}()
-
-	// Start watchers on all subdirectories.
-	for _, sub := range w.walkSubdirs() {
-		sub := sub // capture for goroutine
-		w.wg.Add(1)
-		go func() {
-			defer w.wg.Done()
-			w.readDirectoryChanges(sub)
-		}()
-	}
 
 	return nil
 }
@@ -220,7 +214,7 @@ func (w *Watcher) readDirectoryChanges(dir string) {
 	defer func() { _ = windows.CloseHandle(overlapped.HEvent) }()
 
 	for {
-		// Issue the asynchronous ReadDirectoryChanges call.
+		// Issue a single asynchronous ReadDirectoryChanges call.
 		err := windows.ReadDirectoryChanges(
 			handle,
 			&buf[0],
@@ -235,29 +229,39 @@ func (w *Watcher) readDirectoryChanges(dir string) {
 			return
 		}
 
-		// Wait for the I/O to complete or for shutdown.
-		waitResult, err := windows.WaitForSingleObject(overlapped.HEvent, 500)
-		if err != nil {
-			return
-		}
+		// Wait for this read to complete, polling on a short timeout so we can
+		// react to shutdown. Critically, we must NOT re-issue
+		// ReadDirectoryChanges while one is still pending — reusing the same
+		// handle/overlapped/buffer for a second concurrent read corrupts the
+		// in-flight operation. So on a timeout we simply wait again rather than
+		// looping back to re-issue the read.
+		completed := false
+		for !completed {
+			waitResult, err := windows.WaitForSingleObject(overlapped.HEvent, 500)
+			if err != nil {
+				_ = windows.CancelIo(handle)
+				return
+			}
 
-		// Check for shutdown signal.
-		select {
-		case <-w.done:
-			return
-		default:
-		}
+			// Check for shutdown signal, cancelling the outstanding read.
+			select {
+			case <-w.done:
+				_ = windows.CancelIo(handle)
+				return
+			default:
+			}
 
-		if waitResult != windows.WAIT_OBJECT_0 {
-			// Timeout or error — retry the loop.
-			continue
+			if waitResult == windows.WAIT_OBJECT_0 {
+				completed = true
+			}
+			// WAIT_TIMEOUT (or anything else): keep waiting, do not re-issue.
 		}
 
 		// Get the number of bytes transferred.
 		var bytesTransferred uint32
 		err = windows.GetOverlappedResult(handle, &overlapped, &bytesTransferred, false)
 		if err != nil || bytesTransferred == 0 {
-			// Reset the overlapped event for the next call.
+			// Reset the overlapped event and issue a fresh read.
 			_ = windows.ResetEvent(overlapped.HEvent)
 			continue
 		}
@@ -265,7 +269,7 @@ func (w *Watcher) readDirectoryChanges(dir string) {
 		// Parse the notification records from the buffer.
 		w.parseNotifyBuffer(buf[:bytesTransferred], dir)
 
-		// Reset the overlapped event for the next call.
+		// Reset the overlapped event before issuing the next read.
 		_ = windows.ResetEvent(overlapped.HEvent)
 	}
 }
@@ -467,36 +471,3 @@ func (w *Watcher) shouldIgnore(relPath string) bool {
 	return false
 }
 
-// walkSubdirs returns a list of all subdirectory paths under the
-// watcher's root directory.
-func (w *Watcher) walkSubdirs() []string {
-	var dirs []string
-
-	_ = filepath.WalkDir(w.dir, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			if os.IsPermission(err) && d != nil && d.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-
-		// Skip the root itself.
-		if path == w.dir {
-			return nil
-		}
-
-		if !d.IsDir() {
-			return nil
-		}
-
-		// Skip ignored directories.
-		if w.ignoreMatcher.Match(path) {
-			return filepath.SkipDir
-		}
-
-		dirs = append(dirs, path)
-		return nil
-	})
-
-	return dirs
-}

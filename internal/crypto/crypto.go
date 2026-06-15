@@ -6,10 +6,11 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"runtime"
 	"unsafe"
 
-	"github.com/daniel/gcrypt/internal/models"
+	"github.com/arumes31/gcrypt/internal/models"
 	"golang.org/x/crypto/argon2"
 	"golang.org/x/sys/windows"
 )
@@ -380,10 +381,12 @@ func DeserializeHeader(data []byte) (*models.EncryptedFileHeader, error) {
 		return nil, fmt.Errorf("crypto: invalid magic bytes %q, expected %q", string(header.Magic[:]), models.Magic)
 	}
 
-	// [6:8] Version (little-endian uint16)
+	// [6:8] Version (little-endian uint16). Accept both the single-blob version
+	// and the v2 stream version; the consumer (DecryptBlob vs DecryptStream)
+	// interprets the body accordingly.
 	header.Version = binary.LittleEndian.Uint16(data[6:8])
-	if header.Version != models.CurrentVersion {
-		return nil, fmt.Errorf("crypto: unsupported version %d, expected %d", header.Version, models.CurrentVersion)
+	if header.Version != models.CurrentVersion && header.Version != models.CurrentStreamVersion {
+		return nil, fmt.Errorf("crypto: unsupported version %d", header.Version)
 	}
 
 	// [8:56] Encrypted DEK (48 bytes)
@@ -399,8 +402,254 @@ func DeserializeHeader(data []byte) (*models.EncryptedFileHeader, error) {
 }
 
 // ---------------------------------------------------------------------------
-// Secure Memory Handling
+// Streaming Encryption/Decryption
 // ---------------------------------------------------------------------------
+
+const (
+	// ChunkSize is the size of each encrypted chunk (64 KB).
+	ChunkSize = 64 * 1024
+	// Overhead is the AES-GCM tag size (16 bytes).
+	Overhead = 16
+	// EncryptedChunkSize is ChunkSize + Overhead.
+	EncryptedChunkSize = ChunkSize + Overhead
+)
+
+// streamChunkNonce derives the per-chunk nonce as the content nonce with its
+// low 8 bytes XORed by the chunk index, giving every chunk in a file a unique
+// nonce (the DEK is itself unique per file).
+func streamChunkNonce(contentNonce []byte, chunkIndex uint64) []byte {
+	nonce := make([]byte, nonceSize)
+	copy(nonce, contentNonce)
+	binary.LittleEndian.PutUint64(nonce[0:8], binary.LittleEndian.Uint64(nonce[0:8])^chunkIndex)
+	return nonce
+}
+
+// streamChunkAAD builds the additional authenticated data for a chunk. For v1
+// streams it is baseAAD || chunkIndex. For v2 streams a trailing "final" byte is
+// appended so the position of the last chunk — and therefore the chunk count —
+// is authenticated, defeating truncation and extension of the chunk sequence.
+func streamChunkAAD(baseAAD []byte, chunkIndex uint64, version uint16, final bool) []byte {
+	if version >= models.CurrentStreamVersion {
+		aad := make([]byte, 32+8+1)
+		copy(aad[0:32], baseAAD)
+		binary.LittleEndian.PutUint64(aad[32:40], chunkIndex)
+		if final {
+			aad[40] = 1
+		}
+		return aad
+	}
+	aad := make([]byte, 32+8)
+	copy(aad[0:32], baseAAD)
+	binary.LittleEndian.PutUint64(aad[32:], chunkIndex)
+	return aad
+}
+
+// EncryptStream encrypts data from src and writes it to dst in chunks using the
+// v2 stream format: each chunk's AAD carries its index and whether it is the
+// final chunk, so a ciphertext that is truncated or extended at a chunk boundary
+// fails to authenticate on decryption.
+func EncryptStream(src io.Reader, dst io.Writer, masterKey []byte, filePath string) error {
+	// 1. Generate DEK and encrypt it
+	dek, err := GenerateDEK()
+	if err != nil {
+		return err
+	}
+	defer WipeBytes(dek)
+
+	encryptedDEK, dekNonce, err := EncryptDEK(dek, masterKey)
+	if err != nil {
+		return err
+	}
+
+	// 2. Build and write the header
+	contentNonce := make([]byte, nonceSize)
+	if _, err := rand.Read(contentNonce); err != nil {
+		return err
+	}
+
+	header := &models.EncryptedFileHeader{
+		Version: models.CurrentStreamVersion,
+	}
+	copy(header.Magic[:], models.Magic)
+	copy(header.EncryptedDEK[:], encryptedDEK)
+	copy(header.DEKNonce[:], dekNonce)
+	copy(header.ContentNonce[:], contentNonce)
+
+	headerBytes, err := SerializeHeader(header)
+	if err != nil {
+		return err
+	}
+	if _, err := dst.Write(headerBytes); err != nil {
+		return err
+	}
+
+	// 3. Encrypt content in chunks
+	block, err := aes.NewCipher(dek)
+	if err != nil {
+		return err
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		return err
+	}
+	baseAAD := HashFilePath(filePath)
+
+	// Encrypt with one chunk of read-ahead so we know which chunk is the last
+	// and can mark it final in the AAD. Two buffers are reused and swapped to
+	// avoid per-chunk allocation. An empty input still emits exactly one (empty)
+	// final chunk so the decryptor always sees a final marker.
+	cur := make([]byte, ChunkSize)
+	next := make([]byte, ChunkSize)
+	curN, err := io.ReadFull(src, cur)
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		return err
+	}
+
+	chunkIndex := uint64(0)
+	for {
+		nextN, nerr := io.ReadFull(src, next)
+		if nerr != nil && nerr != io.EOF && nerr != io.ErrUnexpectedEOF {
+			return nerr
+		}
+		final := nextN == 0
+
+		nonce := streamChunkNonce(contentNonce, chunkIndex)
+		aad := streamChunkAAD(baseAAD, chunkIndex, models.CurrentStreamVersion, final)
+		ciphertext := aead.Seal(nil, nonce, cur[:curN], aad)
+		if _, err := dst.Write(ciphertext); err != nil {
+			return err
+		}
+		chunkIndex++
+
+		if final {
+			break
+		}
+		cur, next = next, cur
+		curN = nextN
+	}
+
+	return nil
+}
+
+// DecryptStream decrypts data from src and writes it to dst in chunks. It reads
+// the header version and handles both the v2 format (which authenticates the
+// chunk count via a per-chunk final marker, rejecting truncation/extension) and
+// the legacy v1 format (no final marker) for backward compatibility.
+func DecryptStream(src io.Reader, dst io.Writer, masterKey []byte, filePath string) error {
+	// 1. Read and parse header
+	headerBytes := make([]byte, models.HeaderSize)
+	if _, err := io.ReadFull(src, headerBytes); err != nil {
+		return err
+	}
+
+	header, err := DeserializeHeader(headerBytes)
+	if err != nil {
+		return err
+	}
+
+	// 2. Decrypt DEK
+	dek, err := DecryptDEK(header.EncryptedDEK[:], header.DEKNonce[:], masterKey)
+	if err != nil {
+		return err
+	}
+	defer WipeBytes(dek)
+
+	// 3. Decrypt content in chunks
+	block, err := aes.NewCipher(dek)
+	if err != nil {
+		return err
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		return err
+	}
+
+	baseAAD := HashFilePath(filePath)
+	contentNonce := header.ContentNonce[:]
+
+	if header.Version >= models.CurrentStreamVersion {
+		return decryptStreamV2(src, dst, aead, baseAAD, contentNonce)
+	}
+	return decryptStreamV1(src, dst, aead, baseAAD, contentNonce)
+}
+
+// decryptStreamV2 decrypts a v2 stream, using one chunk of read-ahead so it
+// knows which chunk should carry the final marker. A ciphertext truncated or
+// extended at a chunk boundary makes the computed final flag disagree with what
+// was sealed, so Open fails and the tampering is detected.
+func decryptStreamV2(src io.Reader, dst io.Writer, aead cipher.AEAD, baseAAD, contentNonce []byte) error {
+	cur := make([]byte, EncryptedChunkSize)
+	next := make([]byte, EncryptedChunkSize)
+	curN, err := io.ReadFull(src, cur)
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		return err
+	}
+
+	chunkIndex := uint64(0)
+	for {
+		nextN, nerr := io.ReadFull(src, next)
+		if nerr != nil && nerr != io.EOF && nerr != io.ErrUnexpectedEOF {
+			return nerr
+		}
+		final := nextN == 0
+
+		if curN == 0 {
+			// Nothing to open: the stream ended at the header with no final
+			// chunk, i.e. it was truncated.
+			return fmt.Errorf("crypto: truncated stream (no final chunk)")
+		}
+
+		nonce := streamChunkNonce(contentNonce, chunkIndex)
+		aad := streamChunkAAD(baseAAD, chunkIndex, models.CurrentStreamVersion, final)
+		plaintext, oerr := aead.Open(nil, nonce, cur[:curN], aad)
+		if oerr != nil {
+			return fmt.Errorf("crypto: decrypt chunk %d: %w", chunkIndex, oerr)
+		}
+		if _, werr := dst.Write(plaintext); werr != nil {
+			return werr
+		}
+		chunkIndex++
+
+		if final {
+			break
+		}
+		cur, next = next, cur
+		curN = nextN
+	}
+
+	return nil
+}
+
+// decryptStreamV1 decrypts a legacy v1 stream, which has no final-chunk marker.
+func decryptStreamV1(src io.Reader, dst io.Writer, aead cipher.AEAD, baseAAD, contentNonce []byte) error {
+	ciphertext := make([]byte, EncryptedChunkSize)
+	chunkIndex := uint64(0)
+
+	for {
+		n, err := io.ReadFull(src, ciphertext)
+		if n > 0 {
+			nonce := streamChunkNonce(contentNonce, chunkIndex)
+			aad := streamChunkAAD(baseAAD, chunkIndex, models.CurrentVersion, false)
+			plaintext, oerr := aead.Open(nil, nonce, ciphertext[:n], aad)
+			if oerr != nil {
+				return oerr
+			}
+			if _, werr := dst.Write(plaintext); werr != nil {
+				return werr
+			}
+			chunkIndex++
+		}
+
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
 
 // WipeBytes overwrites the provided byte slice with zeros and uses
 // runtime.KeepAlive to prevent the compiler from optimizing away the
@@ -420,6 +669,9 @@ func WipeBytes(b []byte) {
 // Returns an error if the VirtualLock call fails or if the platform
 // is not Windows.
 func LockMemory(b []byte) error {
+	if len(b) == 0 {
+		return nil
+	}
 	err := windows.VirtualLock(
 		uintptr(unsafe.Pointer(&b[0])),
 		uintptr(len(b)),
@@ -433,6 +685,9 @@ func LockMemory(b []byte) error {
 // UnlockMemory calls VirtualUnlock on Windows to release a memory
 // lock previously established by LockMemory.
 func UnlockMemory(b []byte) error {
+	if len(b) == 0 {
+		return nil
+	}
 	err := windows.VirtualUnlock(
 		uintptr(unsafe.Pointer(&b[0])),
 		uintptr(len(b)),

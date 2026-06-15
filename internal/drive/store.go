@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/daniel/gcrypt/internal/models"
+	"github.com/arumes31/gcrypt/internal/models"
 	"github.com/google/uuid"
 
 	_ "modernc.org/sqlite"
@@ -324,14 +324,12 @@ func (s *Store) DeleteSyncFile(syncRootID, localPath string) error {
 
 	const query = `DELETE FROM sync_map WHERE sync_root_id = ? AND local_path = ?`
 
-	result, err := s.db.Exec(query, syncRootID, localPath)
-	if err != nil {
+	// Deleting a row that does not exist is treated as success: a local file
+	// that was never tracked (e.g. an ignored or never-synced file) can still
+	// generate a delete operation, and that should be a no-op rather than an
+	// error that retries forever.
+	if _, err := s.db.Exec(query, syncRootID, localPath); err != nil {
 		return fmt.Errorf("store: delete sync file: %w", err)
-	}
-
-	rows, _ := result.RowsAffected()
-	if rows == 0 {
-		return fmt.Errorf("store: delete sync file: no row with sync_root_id %q local_path %q", syncRootID, localPath)
 	}
 
 	return nil

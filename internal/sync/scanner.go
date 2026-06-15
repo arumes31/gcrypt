@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -12,10 +13,18 @@ import (
 	"sync"
 	"time"
 
-	"github.com/daniel/gcrypt/internal/models"
+	"github.com/arumes31/gcrypt/internal/models"
 	"golang.org/x/sync/errgroup"
 )
 
+
+// hashCacheEntry is a cached content hash together with the file stamp it was
+// computed from, so the cache can be invalidated when the file changes.
+type hashCacheEntry struct {
+	size    int64
+	modTime time.Time
+	digest  string
+}
 
 // Scanner performs full and single-file directory scans, producing
 // SyncFile records with SHA-256 content hashes for change detection.
@@ -23,7 +32,8 @@ type Scanner struct {
 	dir             string
 	ignore          *IgnoreMatcher
 	selectedFolders []string
-	hashCache       map[string]string // absolute path → hex-encoded SHA-256
+	hashCache       map[string]hashCacheEntry // absolute path → cached hash + stamp
+	muCache         sync.RWMutex              // protects hashCache
 }
 
 // NewScanner creates a new Scanner for the given directory root.
@@ -34,121 +44,161 @@ func NewScanner(dir string, ignorePatterns []string, selectedFolders []string) *
 		dir:             filepath.Clean(dir),
 		ignore:          NewIgnoreMatcher(dir, ignorePatterns),
 		selectedFolders: selectedFolders,
-		hashCache:       make(map[string]string),
+		hashCache:       make(map[string]hashCacheEntry),
 	}
 }
 
 // Scan performs a full recursive walk of the sync directory and returns
 // a SyncFile entry for every non-ignored file found.
+//
+// Scan buffers the entire result in memory. For large sync roots prefer
+// ScanStream, which emits files as they are discovered so callers can begin
+// processing (e.g. uploading) before the walk completes.
 func (s *Scanner) Scan() ([]*models.SyncFile, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	out := make(chan *models.SyncFile, 100)
+
 	var files []*models.SyncFile
-	var mu sync.Mutex
+	done := make(chan struct{})
+	go func() {
+		for sf := range out {
+			files = append(files, sf)
+		}
+		close(done)
+	}()
 
-	g := new(errgroup.Group)
-	g.SetLimit(runtime.NumCPU() * 2)
+	err := s.ScanStream(ctx, out)
+	close(out)
+	<-done
 
-	err := filepath.WalkDir(s.dir, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			// Handle permission errors gracefully — skip files we can't access.
-			if os.IsPermission(err) {
-				if d != nil && d.IsDir() {
-					return filepath.SkipDir
+	if err != nil {
+		return nil, fmt.Errorf("scan directory: %w", err)
+	}
+	return files, nil
+}
+
+// ScanStream performs a full recursive walk of the sync directory and sends a
+// SyncFile entry for every non-ignored regular file to out as it is discovered
+// and hashed. This lets callers begin processing files before the walk
+// finishes, rather than waiting for a complete in-memory slice.
+//
+// ScanStream returns when the walk and all hashing complete, or when ctx is
+// cancelled. The caller retains ownership of out and is responsible for closing
+// it after ScanStream returns. Sends to out are subject to ctx cancellation, so
+// a caller applying backpressure (a slow reader) naturally throttles the scan.
+func (s *Scanner) ScanStream(ctx context.Context, out chan<- *models.SyncFile) error {
+	g, ctx := errgroup.WithContext(ctx)
+
+	// workCh buffers files to be hashed.
+	type scanWork struct {
+		path string
+		info os.FileInfo
+	}
+	workCh := make(chan scanWork, 100)
+
+	// Start a bounded worker pool for hashing files.
+	numWorkers := runtime.NumCPU() * 2
+	for i := 0; i < numWorkers; i++ {
+		g.Go(func() error {
+			for {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case w, ok := <-workCh:
+					if !ok {
+						return nil
+					}
+					sf, err := s.buildSyncFile(w.path, w.info)
+					if err != nil {
+						// Skip files we cannot hash (e.g. locked by another process).
+						continue
+					}
+					select {
+					case <-ctx.Done():
+						return ctx.Err()
+					case out <- sf:
+					}
 				}
+			}
+		})
+	}
+
+	// Producer: walk the directory and enqueue work.
+	g.Go(func() error {
+		defer close(workCh)
+		return filepath.WalkDir(s.dir, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				if os.IsPermission(err) {
+					if d != nil && d.IsDir() {
+						return filepath.SkipDir
+					}
+					return nil
+				}
+				return fmt.Errorf("walk %s: %w", path, err)
+			}
+
+			if path == s.dir {
 				return nil
 			}
-			return fmt.Errorf("walk %s: %w", path, err)
-		}
 
-		// Skip the root directory itself.
-		if path == s.dir {
-			return nil
-		}
-
-		// Check ignore patterns.
-		if s.ignore.Match(path) {
-			if d.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-
-		// Check if file is in selected folders (if any are specified)
-		if len(s.selectedFolders) > 0 {
-			relPath, err := filepath.Rel(s.dir, path)
-			if err != nil {
-				return nil // Skip if we can't get relative path
-			}
-
-			// Convert to slash-separated path for consistent comparison
-			relPath = filepath.ToSlash(relPath)
-
-			// Check if the file is in any of the selected folders
-			inSelectedFolder := false
-			for _, folder := range s.selectedFolders {
-				// Normalize the folder path
-				normalizedFolder := filepath.ToSlash(filepath.Clean(folder))
-				if normalizedFolder == "." {
-					normalizedFolder = ""
-				}
-
-				// Check if the relative path starts with the selected folder
-				if relPath == normalizedFolder || strings.HasPrefix(relPath, normalizedFolder+"/") {
-					inSelectedFolder = true
-					break
-				}
-			}
-
-			if !inSelectedFolder {
-				// Skip if not in any selected folder
+			if s.ignore.Match(path) {
 				if d.IsDir() {
 					return filepath.SkipDir
 				}
 				return nil
 			}
-		}
 
-		// Only process regular files.
-		if d.IsDir() {
-			return nil
-		}
+			if len(s.selectedFolders) > 0 {
+				relPath, err := filepath.Rel(s.dir, path)
+				if err != nil {
+					return nil
+				}
+				relPath = filepath.ToSlash(relPath)
+				inSelectedFolder := false
+				for _, folder := range s.selectedFolders {
+					normalizedFolder := filepath.ToSlash(filepath.Clean(folder))
+					if normalizedFolder == "." {
+						normalizedFolder = ""
+					}
+					if relPath == normalizedFolder || strings.HasPrefix(relPath, normalizedFolder+"/") {
+						inSelectedFolder = true
+						break
+					}
+				}
+				if !inSelectedFolder {
+					if d.IsDir() {
+						return filepath.SkipDir
+					}
+					return nil
+				}
+			}
 
-		info, err := d.Info()
-		if err != nil {
-			// Skip files whose info we cannot read.
-			return nil
-		}
-
-		// Skip non-regular files (symlinks, devices, etc.).
-		if !info.Mode().IsRegular() {
-			return nil
-		}
-
-		// Schedule file hashing and struct building on the worker pool.
-		g.Go(func() error {
-			sf, err := s.buildSyncFile(path, info)
-			if err != nil {
-				// Skip files we cannot hash (e.g. locked by another process).
+			if d.IsDir() {
 				return nil
 			}
 
-			mu.Lock()
-			files = append(files, sf)
-			mu.Unlock()
+			info, err := d.Info()
+			if err != nil {
+				return nil
+			}
+
+			if !info.Mode().IsRegular() {
+				return nil
+			}
+
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case workCh <- scanWork{path: path, info: info}:
+			}
+
 			return nil
 		})
-
-		return nil
 	})
 
-	if err != nil {
-		return nil, fmt.Errorf("scan directory walk: %w", err)
-	}
-
-	if err := g.Wait(); err != nil {
-		return nil, fmt.Errorf("scan directory process: %w", err)
-	}
-
-	return files, nil
+	return g.Wait()
 }
 
 // ScanSingle scans a single file and returns its SyncFile record.
@@ -187,17 +237,26 @@ func (s *Scanner) buildSyncFile(path string, info os.FileInfo) (*models.SyncFile
 }
 
 // ComputeHash computes the SHA-256 hash of a file by reading it in 32 KB
-// chunks. The result is cached so that repeated calls for the same path
-// return the cached hex-encoded digest without re-reading the file.
+// chunks. The result is cached, keyed by the file's size and modification time
+// so that a cached digest is reused only while the file is unchanged. A cache
+// keyed by path alone would return a stale hash after the file was modified,
+// causing later changes to go undetected.
 func (s *Scanner) ComputeHash(path string) (string, error) {
 	absPath, err := filepath.Abs(path)
 	if err != nil {
 		absPath = path
 	}
 
-	// Return cached result if available.
-	if h, ok := s.hashCache[absPath]; ok {
-		return h, nil
+	// Stat the file so the cache entry can be validated against the current
+	// size and modification time.
+	info, statErr := os.Stat(absPath)
+	if statErr == nil {
+		s.muCache.RLock()
+		entry, ok := s.hashCache[absPath]
+		s.muCache.RUnlock()
+		if ok && entry.size == info.Size() && entry.modTime.Equal(info.ModTime()) {
+			return entry.digest, nil
+		}
 	}
 
 	f, err := os.Open(absPath)
@@ -206,14 +265,19 @@ func (s *Scanner) ComputeHash(path string) (string, error) {
 	}
 	defer func() { _ = f.Close() }()
 
-	h := sha256.New()
+	hash := sha256.New()
 	buf := make([]byte, 32*1024) // 32 KB chunks
-	if _, err := io.CopyBuffer(h, f, buf); err != nil {
+	if _, err := io.CopyBuffer(hash, f, buf); err != nil {
 		return "", fmt.Errorf("read for hash: %w", err)
 	}
 
-	digest := hex.EncodeToString(h.Sum(nil))
-	s.hashCache[absPath] = digest
+	digest := hex.EncodeToString(hash.Sum(nil))
+
+	if statErr == nil {
+		s.muCache.Lock()
+		s.hashCache[absPath] = hashCacheEntry{size: info.Size(), modTime: info.ModTime(), digest: digest}
+		s.muCache.Unlock()
+	}
 
 	return digest, nil
 }

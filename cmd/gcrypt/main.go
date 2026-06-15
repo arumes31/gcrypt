@@ -13,8 +13,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/daniel/gcrypt/internal/config"
-	"github.com/daniel/gcrypt/internal/service"
+	"github.com/arumes31/gcrypt/internal/config"
+	"github.com/arumes31/gcrypt/internal/service"
 )
 
 // Version is the application version, embedded at build time.

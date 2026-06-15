@@ -17,7 +17,7 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/daniel/gcrypt/internal/crypto"
+	"github.com/arumes31/gcrypt/internal/crypto"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 )

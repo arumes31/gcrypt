@@ -14,6 +14,16 @@ import (
 	"golang.org/x/oauth2"
 )
 
+// uploadChunkSize is the chunk size used for media uploads. Files at least this
+// large are uploaded resumably: the Google API client buffers one chunk at a
+// time and retries each chunk internally with backoff on transient (5xx/429)
+// failures. Smaller files are sent as a single buffered request that the client
+// can likewise rewind and retry. Either way, transient network errors no longer
+// abort the whole operation even though our media source is a non-seekable pipe.
+// The trade-off is up to this many bytes buffered in memory per concurrent
+// upload.
+const uploadChunkSize = 8 * 1024 * 1024 // 8 MiB
+
 // Client wraps the Google Drive API service and provides high-level operations
 // for file and folder management within the gcrypt root folder.
 type Client struct {
@@ -24,6 +34,9 @@ type Client struct {
 	folderID string
 }
 
+// folderMimeType is the Google Drive MIME type used for folders.
+const folderMimeType = "application/vnd.google-apps.folder"
+
 // DriveFile holds the subset of Google Drive file metadata that gcrypt cares about.
 type DriveFile struct {
 	ID       string
@@ -33,6 +46,11 @@ type DriveFile struct {
 	ModTime  time.Time
 	MD5Hash  string
 	Parents  []string
+}
+
+// IsFolder reports whether this Drive object is a folder.
+func (f *DriveFile) IsFolder() bool {
+	return f.MimeType == folderMimeType
 }
 
 // RateLimitError is returned when the Google Drive API returns a 429 status.
@@ -130,10 +148,53 @@ func (c *Client) EnsureFolder(ctx context.Context, name string) (string, error) 
 	// Folder not found — create it.
 	folder := &drive.File{
 		Name:     name,
-		MimeType: "application/vnd.google-apps.folder",
+		MimeType: folderMimeType,
 		Parents:  []string{parentID},
 	}
 
+	created, err := c.svc.Files.Create(folder).
+		Fields("id").
+		Context(ctx).
+		Do()
+	if err != nil {
+		return "", wrapAPIError(err)
+	}
+
+	return created.Id, nil
+}
+
+// EnsureFolderUnder returns the ID of the folder named name directly under
+// parentID, creating it if it does not already exist. Unlike EnsureFolder,
+// which always operates under the client's configured root, this works under an
+// arbitrary parent and is used to build the encrypted folder chain for the
+// hierarchical layout.
+func (c *Client) EnsureFolderUnder(ctx context.Context, parentID, name string) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	query := fmt.Sprintf(
+		"name='%s' and '%s' in parents and mimeType='%s' and trashed=false",
+		name, parentID, folderMimeType,
+	)
+
+	list, err := c.svc.Files.List().
+		Q(query).
+		Spaces("drive").
+		Fields("files(id)").
+		Context(ctx).
+		Do()
+	if err != nil {
+		return "", wrapAPIError(err)
+	}
+	if len(list.Files) > 0 {
+		return list.Files[0].Id, nil
+	}
+
+	folder := &drive.File{
+		Name:     name,
+		MimeType: folderMimeType,
+		Parents:  []string{parentID},
+	}
 	created, err := c.svc.Files.Create(folder).
 		Fields("id").
 		Context(ctx).
@@ -157,7 +218,7 @@ func (c *Client) UploadFile(ctx context.Context, name string, parentID string, c
 	}
 
 	result, err := c.svc.Files.Create(file).
-		Media(limitUploadReader(content)).
+		Media(limitUploadReader(content), googleapi.ChunkSize(uploadChunkSize)).
 		Fields("id,name,mimeType,size,modifiedTime,md5Checksum,parents").
 		Context(ctx).
 		Do()
@@ -253,7 +314,7 @@ func (c *Client) UpdateFile(ctx context.Context, fileID string, content io.Reade
 	defer c.mu.Unlock()
 
 	result, err := c.svc.Files.Update(fileID, &drive.File{}).
-		Media(limitUploadReader(content)).
+		Media(limitUploadReader(content), googleapi.ChunkSize(uploadChunkSize)).
 		Fields("id,name,mimeType,size,modifiedTime,md5Checksum,parents").
 		Context(ctx).
 		Do()

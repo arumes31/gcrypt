@@ -1,4 +1,4 @@
-module github.com/daniel/gcrypt
+module github.com/arumes31/gcrypt
 
 go 1.26.4
 

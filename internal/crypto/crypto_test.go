@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/daniel/gcrypt/internal/models"
+	"github.com/arumes31/gcrypt/internal/models"
 )
 
 // ---------------------------------------------------------------------------
