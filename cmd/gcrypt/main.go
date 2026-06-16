@@ -114,12 +114,14 @@ func main() {
 		}
 	}
 
-	// 5. Start the tray — this is the blocking main loop. All further user
-	//    interaction (setup, passphrase, sign-in) is driven from the tray.
-	trayApp := service.NewTrayApp(ctrl, logger)
-	trayApp.Run()
+	// 5. Start the Fyne GUI — this is the blocking main loop (it must run on
+	//    the main goroutine). It owns the system tray icon/menu and the
+	//    Nextcloud-style flyout window; all further user interaction (setup,
+	//    passphrase, sign-in) is driven from there.
+	ui := service.NewFyneApp(ctrl, logger)
+	ui.Run()
 
-	// After the tray quits, perform final cleanup.
+	// After the GUI quits, perform final cleanup.
 	ctrl.Shutdown()
 
 	logger.Info("gcrypt shutdown complete")

@@ -82,6 +82,30 @@ type SyncActivity struct {
 	Current []string // short descriptions of the in-flight operations (e.g. "↑ report.pdf")
 }
 
+// ActivityKind classifies a completed sync event for the activity feed.
+type ActivityKind string
+
+const (
+	ActivityUpload   ActivityKind = "upload"
+	ActivityDownload ActivityKind = "download"
+	ActivityDelete   ActivityKind = "delete"
+	ActivityConflict ActivityKind = "conflict"
+)
+
+// ActivityEvent is a single completed sync operation, recorded for the
+// Nextcloud-style activity feed in the GUI. Events are kept in a bounded,
+// most-recent-first ring buffer per engine.
+type ActivityEvent struct {
+	Time   time.Time
+	Kind   ActivityKind
+	Name   string // base file name, e.g. "report.pdf"
+	Path   string // local path relative to the sync root
+	PairID string
+}
+
+// maxRecentEvents bounds the per-engine activity history.
+const maxRecentEvents = 100
+
 // ---------------------------------------------------------------------------
 // Engine
 // ---------------------------------------------------------------------------
@@ -105,6 +129,10 @@ type Engine struct {
 	// activeOps tracks the operation each worker is currently executing,
 	// keyed by worker id. Guarded by mu. Used for the live activity display.
 	activeOps map[int]string
+
+	// recentEvents is a bounded, most-recent-last ring of completed operations
+	// for the GUI activity feed. Guarded by mu.
+	recentEvents []ActivityEvent
 
 	// pendingOps counts operations that have been enqueued but not yet
 	// terminally completed (queued + in-flight + awaiting retry). It is the
@@ -575,6 +603,76 @@ func (e *Engine) markDone(id int) {
 	e.mu.Unlock()
 }
 
+// recordEvent appends a completed operation to the activity feed ring buffer,
+// dropping the oldest entry once the cap is reached.
+func (e *Engine) recordEvent(op *models.SyncOperation) {
+	if op == nil {
+		return
+	}
+	kind := activityKindForOp(op.OpType)
+	if kind == "" {
+		return // not a feed-worthy op type
+	}
+	var name, path string
+	if op.File != nil {
+		path = op.File.LocalPath
+		name = filepath.Base(path)
+	}
+	ev := ActivityEvent{
+		Time:   time.Now(),
+		Kind:   kind,
+		Name:   name,
+		Path:   path,
+		PairID: e.pair.ID,
+	}
+
+	e.mu.Lock()
+	e.recentEvents = append(e.recentEvents, ev)
+	if len(e.recentEvents) > maxRecentEvents {
+		// Drop the oldest events, keeping the most recent maxRecentEvents.
+		e.recentEvents = e.recentEvents[len(e.recentEvents)-maxRecentEvents:]
+	}
+	e.mu.Unlock()
+}
+
+// RecentEvents returns up to limit most-recent-first activity events. A limit
+// <= 0 returns all retained events.
+func (e *Engine) RecentEvents(limit int) []ActivityEvent {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	n := len(e.recentEvents)
+	if n == 0 {
+		return nil
+	}
+	if limit <= 0 || limit > n {
+		limit = n
+	}
+	out := make([]ActivityEvent, 0, limit)
+	// recentEvents is oldest-first; emit most-recent-first.
+	for i := n - 1; i >= 0 && len(out) < limit; i-- {
+		out = append(out, e.recentEvents[i])
+	}
+	return out
+}
+
+// activityKindForOp maps an operation type to an activity feed kind, or "" if
+// the operation should not appear in the feed.
+func activityKindForOp(t models.OpType) ActivityKind {
+	switch t {
+	case models.OpTypeUpload:
+		return ActivityUpload
+	case models.OpTypeDownload:
+		return ActivityDownload
+	case models.OpTypeDeleteRemote, models.OpTypeDeleteLocal:
+		return ActivityDelete
+	case models.OpTypeConflict:
+		return ActivityConflict
+	default:
+		return ""
+	}
+}
+
 // opDescription renders a short, human-readable label for an operation, e.g.
 // "↑ report.pdf" for an upload.
 func opDescription(op *models.SyncOperation) string {
@@ -813,9 +911,10 @@ func (e *Engine) runWorker(id int) {
 					atomic.AddInt64(&e.pendingOps, -1)
 				}
 			} else {
-				// Operation succeeded — terminal. Clear it from the backlog and
-				// update the last sync time.
+				// Operation succeeded — terminal. Clear it from the backlog,
+				// record it for the activity feed, and update the last sync time.
 				atomic.AddInt64(&e.pendingOps, -1)
+				e.recordEvent(op)
 				e.mu.Lock()
 				e.stats.LastSyncTime = time.Now()
 				e.mu.Unlock()

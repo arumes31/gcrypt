@@ -1,4 +1,8 @@
-# gcrypt
+<p align="center">
+  <img src="branding/logo.png" alt="gcrypt logo" width="140">
+</p>
+
+<h1 align="center">gcrypt</h1>
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 ![Windows](https://img.shields.io/badge/Platform-Windows%2010%2B-green.svg)

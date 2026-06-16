@@ -3,6 +3,7 @@ package sync
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -348,6 +349,26 @@ func (m *SyncManager) GetAggregatedState() AggregatedState {
 
 	result.OverallState = computeOverallState(result.PairStatuses)
 	return result
+}
+
+// RecentActivity returns up to limit most-recent-first completed events merged
+// across all engines. A limit <= 0 returns all retained events.
+func (m *SyncManager) RecentActivity(limit int) []ActivityEvent {
+	m.mu.RLock()
+	merged := make([]ActivityEvent, 0, len(m.engines)*8)
+	for _, engine := range m.engines {
+		merged = append(merged, engine.RecentEvents(0)...)
+	}
+	m.mu.RUnlock()
+
+	// Most-recent-first across all pairs.
+	sort.Slice(merged, func(i, j int) bool {
+		return merged[i].Time.After(merged[j].Time)
+	})
+	if limit > 0 && limit < len(merged) {
+		merged = merged[:limit]
+	}
+	return merged
 }
 
 // StateChanges returns a channel that emits aggregated state changes.
