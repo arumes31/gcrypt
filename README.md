@@ -15,6 +15,7 @@
 - [Features](#features)
 - [Security Model](#security-model)
 - [Installation](#installation)
+- [Google Drive API Setup](#google-drive-api-setup)
 - [Usage](#usage)
 - [Accessing Your Sync on Another PC](#accessing-your-sync-on-another-pc)
 - [Configuration](#configuration)
@@ -131,6 +132,87 @@ go build -o gcrypt.exe ./cmd/gcrypt/
 # Run setup (first time only)
 ./gcrypt.exe -setup
 ```
+
+---
+
+## Google Drive API Setup
+
+To use `gcrypt`, you need to set up a Google Cloud project with the Google Drive API enabled and configure OAuth client credentials. Follow these detailed steps:
+
+### 1. Create a Google Cloud Project
+1. Open the [Google Cloud Console](https://console.cloud.google.com/).
+2. Click the project dropdown in the top-left corner and select **New Project**.
+3. Enter a project name (e.g., `gcrypt-sync`) and click **Create**.
+
+### 2. Enable the Google Drive API
+1. Navigate to **APIs & Services** > **Library** using the left sidebar.
+2. Search for **Google Drive API**.
+3. Click on the Google Drive API result and click **Enable**.
+
+### 3. Configure the OAuth Consent Screen
+1. Go to **APIs & Services** > **OAuth consent screen** in the left sidebar.
+2. Select **External** as the User Type (this allows you to use your personal Google account) and click **Create**.
+3. Provide the required App Information:
+   - **App name**: `gcrypt`
+   - **User support email**: Select your email address.
+   - **Developer contact information**: Enter your email address.
+   - Click **Save and Continue**.
+4. Configure **Scopes**:
+   - Click **Add or Remove Scopes**.
+   - Under *Manually add scopes*, enter: `https://www.googleapis.com/auth/drive.file`
+   - Click **Add to Table** and click **Update**.
+   - Click **Save and Continue**.
+     > 🔒 **Privacy Note:** `gcrypt` uses the narrow `drive.file` scope. This means it can only access files and folders that it creates or that the user explicitly opens with it. It cannot read, modify, or delete any other files in your Google Drive.
+5. Configure **Test Users**:
+   - Google restricts unverified apps in "Testing" status to specific authorized users.
+   - Click **Add Users** and enter the email address of the Google Account you wish to sync files with.
+   - Click **Save and Continue**, review the summary, and return to the dashboard.
+
+### 4. Create OAuth Client Credentials
+1. Navigate to **APIs & Services** > **Credentials** in the left sidebar.
+2. Click **+ Create Credentials** at the top of the page and select **OAuth client ID**.
+3. Select **Application type**: **Web application**.
+   > ℹ️ **Why Web application?**
+   > `gcrypt` listens on a local loopback port (`http://localhost:8089/callback`) to receive the OAuth authorization code after you sign in via your web browser. A Web Application client ID is required to register this redirect URI.
+4. Enter a name (e.g., `gcrypt-client`).
+5. Under **Authorized redirect URIs**, click **+ Add URI** and enter exactly:
+   ```
+   http://localhost:8089/callback
+   ```
+6. Click **Create**.
+7. Copy the generated **Client ID** and **Client Secret**. Keep these secure.
+
+### 5. Configure gcrypt with Credentials
+You can provide these credentials to `gcrypt` in one of two ways:
+
+#### Method A: The Setup Wizard (Recommended)
+When you run `./gcrypt.exe -setup` (or when prompted by the system tray GUI on first launch), you will be asked to enter the **Client ID** and **Client Secret**. `gcrypt` will encrypt the secret using your passphrase-derived master key and persist both in your config file (`%APPDATA%\gcrypt\config.yaml`):
+```yaml
+oauth:
+  client_id: "YOUR_CLIENT_ID"
+  client_secret_enc: "ENCRYPTED_SECRET_BASE64"
+```
+
+#### Method B: Environment Variables
+If you prefer not to store credentials in your configuration file, you can set them as environment variables before starting `gcrypt`. This is especially useful for Docker container deployment or scripts:
+- **PowerShell / Windows Terminal**:
+  ```powershell
+  $env:GCRYPT_OAUTH_CLIENT_ID="your-client-id"
+  $env:GCRYPT_OAUTH_CLIENT_SECRET="your-client-secret"
+  ./gcrypt.exe
+  ```
+- **Windows Command Prompt (CMD)**:
+  ```cmd
+  set GCRYPT_OAUTH_CLIENT_ID=your-client-id
+  set GCRYPT_OAUTH_CLIENT_SECRET=your-client-secret
+  gcrypt.exe
+  ```
+- **Linux / Docker** (if applicable):
+  ```bash
+  export GCRYPT_OAUTH_CLIENT_ID="your-client-id"
+  export GCRYPT_OAUTH_CLIENT_SECRET="your-client-secret"
+  ```
+When these environment variables are set, they take precedence over config settings and bypass the credential prompt.
 
 ---
 
