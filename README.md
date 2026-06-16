@@ -237,16 +237,21 @@ gcrypt automatically adds itself to Windows startup. Enable/disable in:
 - Settings → Apps → Startup → gcrypt
 - Or via the main window's **Settings** tab: **Auto-start with Windows**
 
-### System Tray Interface
+### System Tray & Status Indicators
 
-`gcrypt` runs in the background with a system tray icon that reflects the current status of the application:
+`gcrypt` runs in the background. Its status is represented by the system tray icon, and inside the main GUI window by a colored status dot and label:
 
-| Tray Icon | App State | Meaning / Action Required |
-|-----------|-----------|---------------------------|
-| 🟢 **Synced** | Idle | Up to date (all systems normal) |
-| 🔵 **Syncing** | Connecting, Scanning, Syncing | Active operations / scanning for changes |
-| 🟡 **Warning** | Not Configured, Locked, Sign In Required | Needs user action (run setup, enter passphrase, or authenticate) |
-| 🔴 **Error** | Error, Disconnected | Error occurred or network is disconnected (see logs) |
+| App State | Tray Icon File | System Tray Icon | GUI Status Dot Color | GUI Status Label | Meaning / Action Required |
+|-----------|----------------|------------------|----------------------|------------------|---------------------------|
+| **Not Configured** | `warning.png` | 🟡 Warning | 🔘 Gray | "Not configured" | The app has not been set up yet. Run the setup wizard. |
+| **Locked** | `warning.png` | 🟡 Warning | 🟡 Amber | "Locked" | Master key is not decrypted. Enter your passphrase to unlock. |
+| **Sign In Required** | `warning.png` | 🟡 Warning | 🔴 Red | "Sign in required" | OAuth token is missing or expired. Click to sign in. |
+| **Connecting** | `syncing.png` | 🔵 Syncing | 🔵 Blue | "Connecting…" | Establishing connection to Google Drive API. |
+| **Scanning** | `syncing.png` | 🔵 Syncing | 🔵 Blue | "Scanning…" | Scanning local/remote directories for changes. |
+| **Syncing** | `syncing.png` | 🔵 Syncing | 🔵 Blue | "Syncing…" | Uploading or downloading files. |
+| **Idle** | `synced.png` | 🟢 Synced | 🟢 Green | "Up to date" | Synchronized and idle. |
+| **Error** | `error.png` | 🔴 Error | 🔴 Red | "Error" | Critical error occurred. Check the log file for details. |
+| **Disconnected** | `error.png` | 🔴 Error | 🔴 Red | "Disconnected" | Network offline or connection timed out. |
 
 #### Tray Menu Structure
 
