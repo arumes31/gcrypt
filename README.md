@@ -10,23 +10,6 @@
 
 **gcrypt** is a Windows desktop Google Drive sync client with client-side encryption. All files are encrypted locally before being uploaded to Google Drive, ensuring that no plaintext data ever leaves your machine.
 
-## New in gcrypt v2
-
-### ✨ Multi-Sync Support
-Sync multiple directory pairs simultaneously. Configure and manage independent sync relationships from the system tray menu.
-
-### 🛠️ Tray Menu Settings UI
-Full settings configuration directly from the system tray—no config file editing required. Adjust global settings and per-pair options on the fly.
-
-### 🔐 Enhanced Security
-- Industry-standard **Argon2id** for key derivation (64 MiB memory, 3 iterations)
-- Per-file unique keys with **AES-256-GCM** encryption
-- File path binding via SHA-256 AAD to prevent relocation attacks
-- Memory-protected master key using Windows VirtualLock
-
-### 📊 Real-Time Status Monitoring
-Visual status indicators for each sync pair (Idle, Syncing, Scanning, Error, Paused). Monitor global and per-directory sync statistics.
-
 ## Table of Contents
 
 - [Features](#features)
