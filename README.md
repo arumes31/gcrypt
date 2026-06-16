@@ -118,16 +118,19 @@ Encrypt with AES-256-GCM (AAD = SHA-256(filePath))
 - Windows 10 or later (64-bit)
 - Google account with Drive access
 - Go 1.26.4 or later (for building from source)
+- GCC compiler (e.g., MinGW-w64) with `cgo` support enabled (required by the Fyne GUI package)
 
 ### Building from Source
 
-```bash
+Because `gcrypt` uses the Fyne GUI toolkit, building requires CGO. Additionally, on Go 1.26+, a clang-only compilation flag causes default GCC builds to fail. To automate building the custom compiler wrapper and compiling `gcrypt` as a background GUI process, use the provided PowerShell build script:
+
+```powershell
 # Clone the repository
 git clone https://github.com/yourusername/gcrypt.git
 cd gcrypt
 
-# Build the application
-go build -o gcrypt.exe ./cmd/gcrypt/
+# Run the build script (compiles the gcc wrapper and gcrypt.exe)
+powershell -File .\build.ps1
 
 # Run setup (first time only)
 ./gcrypt.exe -setup
@@ -390,9 +393,9 @@ SQLite is used for local state tracking, mapping local files to encrypted remote
 ## Troubleshooting
 
 ### Common Issues
-1. **Red Icon**: Authentication expired or network issue. Re-authenticate via Tray.
-2. **Yellow Icon Stays**: Check logs for disk permission errors.
-3. **Database Error**: Try deleting `.gcrypt-state/*.db` and re-syncing.
+1. **Red Icon (Error / Disconnected)**: A critical synchronization error occurred or the network is offline. Check the log file (`%APPDATA%\gcrypt\gcrypt.log`) for error details.
+2. **Yellow Icon (Warning)**: Action is required to resume sync. Open the gcrypt GUI panel to run setup, unlock the app using your passphrase, or authenticate with Google.
+3. **Database Error**: Try deleting the local state database at `%APPDATA%\gcrypt\gcrypt.db` and restarting the application to rebuild the local file metadata cache.
 
 ---
 
