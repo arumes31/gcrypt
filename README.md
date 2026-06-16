@@ -235,53 +235,46 @@ When these environment variables are set, they take precedence over config setti
 #### Auto-Start
 gcrypt automatically adds itself to Windows startup. Enable/disable in:
 - Settings → Apps → Startup → gcrypt
-- Or via tray menu: Settings → Auto-start with Windows
+- Or via the main window's **Settings** tab: **Auto-start with Windows**
 
 ### System Tray Interface
 
-gcrypt runs in the background with a system tray icon:
+`gcrypt` runs in the background with a system tray icon that reflects the current status of the application:
 
-| Icon | Status |
-|------|--------|
-| 🟢 Green | Idle (all systems normal) |
-| 🔵 Blue | Syncing in progress |
-| 🟡 Yellow | Scanning files |
-| 🔴 Red | Error (check log) |
-| ⚪ Gray | Paused |
+| Tray Icon | App State | Meaning / Action Required |
+|-----------|-----------|---------------------------|
+| 🟢 **Synced** | Idle | Up to date (all systems normal) |
+| 🔵 **Syncing** | Connecting, Scanning, Syncing | Active operations / scanning for changes |
+| 🟡 **Warning** | Not Configured, Locked, Sign In Required | Needs user action (run setup, enter passphrase, or authenticate) |
+| 🔴 **Error** | Error, Disconnected | Error occurred or network is disconnected (see logs) |
 
 #### Tray Menu Structure
+
+Right-clicking the tray icon opens a quick-access menu:
+
 ```
-📊 Status: Idle              Selected folder: Syncing
-📁 Files synced: 1,234       Last sync: 5 minutes ago
-
-Sync Pairs ─────────────────
-  🟢 Documents          🟢 Downloads
-  ▶ Pause               ▶ Pause
-  🔄 Sync Now           🔄 Sync Now
-  📂 Open Folder        📂 Open Folder
-  ─────────             ─────────
-  ⚠️ Remove*            ⚠️ Remove*
-
-─────────────────────────────
-⏸️ Pause All
-🔄 Sync All Now
-
-Settings ───────────────────
-  ☑ Auto-start with Windows
-  ☐ Start minimized
-  ─────────
-  Sync Interval: [10s ▼]
-  Max File Size: [100 MB ▼]
-  Log Level: [Info ▼]
-  Log Max Size: [10 MB ▼]
-  Log Backups: [3 ▼]
-
-─────────────────────────────
-📂 Open Primary Folder
-📋 View Log
-─────────────────────────────
-❌ Quit
+Open gcrypt             <-- Opens the main GUI flyout window
+───────────────────────
+Sync All Now            <-- Force scan and sync of all folder pairs
+Pause All / Resume All  <-- Toggle sync state globally
+Open Sync Folder        <-- Open local sync directory in Explorer
+View Log                <-- Open log file in Notepad
+───────────────────────
+Quit                    <-- Gracefully stop sync engines and exit
 ```
+
+#### Main GUI Flyout Window
+
+Left-clicking the tray icon (or selecting **Open gcrypt**) opens a flyout window similar to Nextcloud, containing the following tabs:
+1. **Activity** — Shows a real-time list of synced files, errors, and progress.
+2. **Folders** — Shows status of individual sync pairs, allowing per-pair Pause/Resume, Sync Now, Open Folder, and Remove options.
+3. **Settings** — Allows managing global parameters such as:
+   - Auto-start with Windows
+   - Remember passphrase (auto-unlock via Windows DPAPI)
+   - Sync Interval
+   - Max File Size limit
+   - Log settings (Level, Max Size, Max Backups)
+   - Bandwidth Rate Limits (Upload/Download in KB/s)
 
 ---
 
