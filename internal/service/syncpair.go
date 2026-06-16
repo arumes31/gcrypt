@@ -15,6 +15,9 @@ func pairDisplayName(pair *config.SyncPair) string {
 	if pair.LocalDir != "" {
 		return filepath.Base(pair.LocalDir)
 	}
+	if len(pair.ID) < 8 {
+		return pair.ID
+	}
 	return pair.ID[:8]
 }
 

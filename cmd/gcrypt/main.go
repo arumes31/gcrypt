@@ -10,6 +10,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 
@@ -34,6 +35,15 @@ func main() {
 	// Hide the stray console window for double-click launches (no-op when run
 	// from a terminal or when built with -H=windowsgui).
 	hideConsoleIfOwned()
+
+	// Under Remote Desktop there is no hardware OpenGL, which would otherwise
+	// stop Fyne from ever creating its window. Switch on the bundled software
+	// OpenGL renderer before any GUI initialisation so the flyout window works
+	// over RDP (requires the Mesa opengl32.dll shipped next to the binary).
+	remoteSession := isRemoteSession()
+	if remoteSession {
+		enableSoftwareOpenGL()
+	}
 
 	flag.Parse()
 
@@ -80,6 +90,14 @@ func main() {
 	}
 	defer func() { _ = logger.Close() }()
 
+	// Route the standard library logger into our log file. Fyne reports GUI
+	// failures (e.g. "Fyne error: window creation error / Cause: WGL: The driver
+	// does not appear to support OpenGL") via the std log package; in the
+	// -H=windowsgui build there is no console, so without this those errors would
+	// be silently lost and the flyout window would just fail to appear.
+	log.SetFlags(0)
+	log.SetOutput(logger.Writer())
+
 	// Apply persisted logging settings (level + rotation) so the configured
 	// values take effect from startup, not just after a runtime change.
 	if cfg != nil {
@@ -97,6 +115,13 @@ func main() {
 	logger.Info("gcrypt starting", map[string]interface{}{
 		"version": Version,
 	})
+
+	if remoteSession {
+		logger.Info("Remote Desktop session detected; enabled software OpenGL (Mesa llvmpipe) for the GUI", map[string]interface{}{
+			"gallium_driver": os.Getenv("GALLIUM_DRIVER"),
+			"hint":           "the flyout window needs a Mesa opengl32.dll next to gcrypt.exe over RDP",
+		})
+	}
 
 	// 3. Create AppController (determines initial state from config).
 	ctrl := service.NewAppController(cfg, logger)

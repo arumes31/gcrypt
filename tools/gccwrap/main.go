@@ -14,7 +14,19 @@ package main
 import (
 	"os"
 	"os/exec"
+	"strings"
 )
+
+// sameFile reports whether two paths refer to the same file on disk. It falls
+// back to a case-insensitive string compare if either path cannot be stat'd.
+func sameFile(a, b string) bool {
+	ai, aerr := os.Stat(a)
+	bi, berr := os.Stat(b)
+	if aerr == nil && berr == nil {
+		return os.SameFile(ai, bi)
+	}
+	return strings.EqualFold(a, b)
+}
 
 func main() {
 	// Drop the offending flag; forward everything else verbatim.
@@ -32,6 +44,13 @@ func main() {
 		p, err := exec.LookPath("gcc")
 		if err != nil {
 			os.Stderr.WriteString("gccwrap: cannot find real gcc on PATH: " + err.Error() + "\n")
+			os.Exit(1)
+		}
+		// Guard against recursion: if the wrapper was named gcc.exe and placed on
+		// PATH, LookPath("gcc") could resolve back to this binary. Refuse rather
+		// than fork-bomb.
+		if self, serr := os.Executable(); serr == nil && sameFile(self, p) {
+			os.Stderr.WriteString("gccwrap: refusing to invoke self (resolved gcc is this wrapper at " + p + "); set REAL_CC to the real gcc\n")
 			os.Exit(1)
 		}
 		real = p
