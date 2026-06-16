@@ -1160,10 +1160,15 @@ func (e *Engine) resolveConflict(sf *models.SyncFile) error {
 	// Remote newer (or identical timestamp) → remote wins: preserve the local
 	// copy as a timestamped backup, then download the remote version.
 	// downloadFile records the new remote hash, so the conflict does not
-	// re-trigger on every subsequent poll.
+	// re-trigger on every subsequent poll. The backup is best-effort and is
+	// streamed so large files are not loaded fully into memory.
 	backupPath := fmt.Sprintf("%s.conflict.%s", localPath, time.Now().Format("20060102-150405"))
-	if data, err := os.ReadFile(localPath); err == nil {
-		_ = os.WriteFile(backupPath, data, 0600)
+	if src, err := os.Open(localPath); err == nil {
+		if dst, err := os.OpenFile(backupPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600); err == nil {
+			_, _ = io.Copy(dst, src)
+			_ = dst.Close()
+		}
+		_ = src.Close()
 	}
 	return e.downloadFile(sf)
 }

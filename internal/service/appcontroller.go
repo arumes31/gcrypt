@@ -574,7 +574,22 @@ func (ac *AppController) StartSync() error {
 	driveClient := ac.driveClient
 	masterKey := ac.masterKey
 	logger := ac.logger
+	// Tear down any previous sync session before starting a new one so we don't
+	// leak the old manager's goroutines or the old metadata-store DB handle.
+	// StartSync can run more than once per process — e.g. re-entering the
+	// passphrase after an auth error, or re-running the OAuth flow.
+	prevManager := ac.manager
+	prevStore := ac.tokenStore
+	ac.manager = nil
+	ac.tokenStore = nil
 	ac.mu.Unlock()
+
+	if prevManager != nil {
+		prevManager.StopAll()
+	}
+	if prevStore != nil {
+		_ = prevStore.Close()
+	}
 
 	if cfg == nil {
 		return fmt.Errorf("service: config is required to start sync")

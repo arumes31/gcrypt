@@ -61,6 +61,7 @@ type SyncManager struct {
 	stateChangeCh chan AggregatedState
 	errorCh       chan error
 	stopCh        chan struct{}
+	stopOnce      sync.Once // guards close(stopCh) so StopAll is idempotent
 
 	// Track per-engine error forwarding cancel functions so we can clean up
 	// when an engine is removed.
@@ -154,11 +155,10 @@ func (m *SyncManager) StartAllAsync() error {
 
 // StopAll stops all running engines and signals the aggregation goroutine.
 func (m *SyncManager) StopAll() {
-	// Signal the aggregation goroutine to stop.
-	select {
-	case m.stopCh <- struct{}{}:
-	default:
-	}
+	// Close stopCh to broadcast shutdown to the aggregation goroutine and every
+	// per-engine async-error forwarder (a single send would wake only one of
+	// them, leaking the rest). Guarded so StopAll can be called more than once.
+	m.stopOnce.Do(func() { close(m.stopCh) })
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -185,7 +185,11 @@ func (m *SyncManager) StopAll() {
 func (m *SyncManager) AddPair(pair *config.SyncPair) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.addPairLocked(pair, false)
+	// Start asynchronously: engine.Start() runs the full initial scan+enqueue
+	// inline, which would hold m.mu (and, via the caller, the tray lock) for the
+	// whole scan and freeze the UI. StartAsync returns immediately and scans in
+	// the background, matching StartAllAsync.
+	return m.addPairLocked(pair, true)
 }
 
 // addPairLocked is the internal implementation that must be called with m.mu held.

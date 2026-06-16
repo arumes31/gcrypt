@@ -89,7 +89,7 @@ func main() {
 		if cfg.App.LogMaxSize > 0 {
 			logger.SetMaxSize(int64(cfg.App.LogMaxSize) * 1024 * 1024)
 		}
-		if cfg.App.LogMaxBackups >= 1 {
+		if cfg.App.LogMaxBackups >= 0 {
 			logger.SetMaxBackups(cfg.App.LogMaxBackups)
 		}
 	}
