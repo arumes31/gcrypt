@@ -659,6 +659,14 @@ func (e *Engine) processEvents() {
 				// Try to preserve existing remote ID from the store.
 				existing, err := e.store.GetSyncFile(e.pair.ID, ev.Path)
 				if err == nil && existing != nil {
+					// If the file is already recorded as synced with this exact
+					// content, the event carries no real change — most commonly
+					// it was triggered by our own write while downloading the
+					// file. Skip the redundant upload to avoid re-encrypting and
+					// re-pushing every downloaded file.
+					if existing.SyncStatus == models.SyncStatusSynced && existing.LocalHash == sf.LocalHash {
+						continue
+					}
 					sf.RemoteID = existing.RemoteID
 				}
 				e.enqueueWork(newSyncOperation(sf, models.OpTypeUpload, e.maxRetries))
@@ -1111,17 +1119,32 @@ func (e *Engine) deleteLocal(sf *models.SyncFile) error {
 // Conflict Resolution
 // ---------------------------------------------------------------------------
 
-// resolveConflict implements last-write-wins conflict resolution.
+// resolveConflict reconciles a file that changed remotely. If the local copy is
+// untouched since the last sync it simply pulls the remote update; if the local
+// copy also changed it applies last-write-wins, preserving the local copy as a
+// backup when the remote version wins.
 func (e *Engine) resolveConflict(sf *models.SyncFile) error {
-	// 1. Compare local and remote modification times.
-	localModTime := sf.ModTime
-	// Use the current file's mod time from disk if available.
 	localPath := filepath.Join(e.pair.LocalDir, sf.LocalPath)
+
+	// If the local copy is gone, re-create it from the remote. A genuine local
+	// deletion is reconciled separately via delete operations; pulling the
+	// remote here is the safe default and never loses data.
+	if _, statErr := os.Stat(localPath); os.IsNotExist(statErr) {
+		return e.downloadFile(sf)
+	}
+
+	// If the local copy is unchanged since our last sync (sf.LocalHash is the
+	// content hash recorded then), there is no real conflict — just pull the
+	// remote update without creating a backup.
+	if curHash, err := e.scanner.ComputeHash(localPath); err == nil && curHash == sf.LocalHash {
+		return e.downloadFile(sf)
+	}
+
+	// Both sides diverged — apply last-write-wins by modification time.
+	localModTime := sf.ModTime
 	if info, err := os.Stat(localPath); err == nil {
 		localModTime = info.ModTime()
 	}
-
-	// Get remote modification time.
 	var remoteModTime time.Time
 	if sf.RemoteID != "" {
 		if remoteFile, err := e.driveClient.GetFile(e.ctx, sf.RemoteID); err == nil {
@@ -1129,27 +1152,20 @@ func (e *Engine) resolveConflict(sf *models.SyncFile) error {
 		}
 	}
 
-	// 2. If local is newer: upload local version (overwrite remote).
+	// Local strictly newer → push the local version over the remote.
 	if localModTime.After(remoteModTime) {
 		return e.uploadFile(sf)
 	}
 
-	// 3. If remote is newer: save a conflict backup, then download.
-	if remoteModTime.After(localModTime) {
-		// Save current local file as a conflict backup.
-		backupPath := fmt.Sprintf("%s.conflict.%s", localPath, time.Now().Format("20060102-150405"))
-		if data, err := os.ReadFile(localPath); err == nil {
-			_ = os.WriteFile(backupPath, data, 0600)
-		}
-		// Download the remote version.
-		return e.downloadFile(sf)
+	// Remote newer (or identical timestamp) → remote wins: preserve the local
+	// copy as a timestamped backup, then download the remote version.
+	// downloadFile records the new remote hash, so the conflict does not
+	// re-trigger on every subsequent poll.
+	backupPath := fmt.Sprintf("%s.conflict.%s", localPath, time.Now().Format("20060102-150405"))
+	if data, err := os.ReadFile(localPath); err == nil {
+		_ = os.WriteFile(backupPath, data, 0600)
 	}
-
-	// Same timestamp — treat as synced.
-	if err := e.store.UpdateStatus(e.pair.ID, sf.LocalPath, models.SyncStatusSynced); err != nil {
-		return fmt.Errorf("sync: update status after conflict %s: %w", sf.LocalPath, err)
-	}
-	return nil
+	return e.downloadFile(sf)
 }
 
 // ---------------------------------------------------------------------------
@@ -1162,10 +1178,13 @@ func (e *Engine) resolveConflict(sf *models.SyncFile) error {
 func (e *Engine) pollRemoteChanges() {
 	defer e.wg.Done()
 
-	// Determine the sync interval from the pair (default 5 minutes).
+	// Determine the sync interval from the pair, flooring it at 5 seconds so a
+	// misconfigured tiny value can't hammer the Drive API. (Previously a value
+	// below 5s was bumped all the way up to 5 minutes, which surprisingly made a
+	// "fast" interval the slowest.)
 	interval := time.Duration(e.pair.EffectiveSyncInterval()) * time.Second
 	if interval < 5*time.Second {
-		interval = 5 * time.Minute
+		interval = 5 * time.Second
 	}
 
 	ticker := time.NewTicker(interval)
@@ -1224,10 +1243,10 @@ func (e *Engine) pollOnce() error {
 		return fmt.Errorf("list store files: %w", err)
 	}
 
-	remoteIDSet := make(map[string]struct{}, len(trackedFiles))
+	remoteByID := make(map[string]*models.SyncFile, len(trackedFiles))
 	for _, sf := range trackedFiles {
 		if sf.RemoteID != "" {
-			remoteIDSet[sf.RemoteID] = struct{}{}
+			remoteByID[sf.RemoteID] = sf
 		}
 	}
 
@@ -1236,9 +1255,10 @@ func (e *Engine) pollOnce() error {
 		return nil
 	}
 
-	// For each remote file not in the store → create a download operation.
 	for _, rf := range remoteFiles {
-		if _, tracked := remoteIDSet[rf.ID]; !tracked {
+		tracked, isTracked := remoteByID[rf.ID]
+		if !isTracked {
+			// New remote file → download.
 			sf := &models.SyncFile{
 				LocalPath:  rf.LocalPath,
 				RemoteID:   rf.ID,
@@ -1247,6 +1267,25 @@ func (e *Engine) pollOnce() error {
 				ModTime:    rf.ModTime,
 			}
 			e.enqueueWork(newSyncOperation(sf, models.OpTypeDownload, e.maxRetries))
+			continue
+		}
+
+		// Already tracked: detect a remote modification (e.g. another machine
+		// edited the file) by comparing the Drive content hash against what we
+		// recorded at the last sync. Without this, edits to existing files never
+		// propagate — only new files and deletions would. A change is reconciled
+		// via conflict resolution, which pulls the remote update when the local
+		// copy is untouched and otherwise backs up the local copy first.
+		if rf.RemoteHash != "" && tracked.RemoteHash != "" && rf.RemoteHash != tracked.RemoteHash {
+			sf := &models.SyncFile{
+				LocalPath:  tracked.LocalPath,
+				RemoteID:   rf.ID,
+				RemoteHash: rf.RemoteHash,
+				LocalHash:  tracked.LocalHash,
+				Size:       rf.Size,
+				ModTime:    rf.ModTime,
+			}
+			e.enqueueWork(newSyncOperation(sf, models.OpTypeConflict, e.maxRetries))
 		}
 	}
 

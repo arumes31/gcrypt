@@ -1,6 +1,7 @@
 package crypto
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -155,179 +156,28 @@ func DecryptDEK(encryptedDEK []byte, dekNonce []byte, masterKey []byte) ([]byte,
 }
 
 // ---------------------------------------------------------------------------
-// File Encryption/Decryption
+// In-memory helpers (small values: OAuth token, client secret)
 // ---------------------------------------------------------------------------
 
-// EncryptFile encrypts file content using the per-file DEK with AES-256-GCM.
-// The filePath is used to compute Additional Authenticated Data (AAD) via
-// SHA-256, binding the ciphertext to the file identity and preventing
-// relocation attacks.
-//
-// Returns the encrypted file header (containing the content nonce) and the
-// ciphertext (which includes the 16-byte GCM tag appended).
-func EncryptFile(plaintext []byte, dek []byte, filePath string) (*models.EncryptedFileHeader, []byte, error) {
-	if len(dek) != dekSize {
-		return nil, nil, fmt.Errorf("crypto: DEK must be %d bytes, got %d", dekSize, len(dek))
+// EncryptBytes encrypts an in-memory plaintext using the v2 stream format and
+// returns the ciphertext. It is a convenience wrapper around EncryptStream for
+// small values such as the OAuth token and client secret.
+func EncryptBytes(plaintext, masterKey []byte, path string) ([]byte, error) {
+	var buf bytes.Buffer
+	if err := EncryptStream(bytes.NewReader(plaintext), &buf, masterKey, path); err != nil {
+		return nil, err
 	}
-
-	block, err := aes.NewCipher(dek)
-	if err != nil {
-		return nil, nil, fmt.Errorf("crypto: failed to create AES cipher: %w", err)
-	}
-
-	aead, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, nil, fmt.Errorf("crypto: failed to create GCM: %w", err)
-	}
-
-	// Generate random 12-byte content nonce
-	contentNonce := make([]byte, nonceSize)
-	if _, err := rand.Read(contentNonce); err != nil {
-		return nil, nil, fmt.Errorf("crypto: failed to generate content nonce: %w", err)
-	}
-
-	// Compute AAD = SHA-256(filePath) to bind ciphertext to the file path
-	aad := HashFilePath(filePath)
-
-	// Encrypt with AES-256-GCM
-	ciphertext := aead.Seal(nil, contentNonce, plaintext, aad)
-
-	// Build the header
-	header := &models.EncryptedFileHeader{
-		Version: models.CurrentVersion,
-	}
-	copy(header.Magic[:], models.Magic)
-	copy(header.ContentNonce[:], contentNonce)
-
-	return header, ciphertext, nil
+	return buf.Bytes(), nil
 }
 
-// DecryptFile decrypts file content using the per-file DEK with AES-256-GCM.
-// It recomputes the AAD from the filePath to verify that the ciphertext
-// belongs to the claimed file path.
-func DecryptFile(ciphertext []byte, header *models.EncryptedFileHeader, dek []byte, filePath string) ([]byte, error) {
-	if len(dek) != dekSize {
-		return nil, fmt.Errorf("crypto: DEK must be %d bytes, got %d", dekSize, len(dek))
+// DecryptBytes reverses EncryptBytes, decrypting an in-memory v2-stream
+// ciphertext and returning the plaintext.
+func DecryptBytes(ciphertext, masterKey []byte, path string) ([]byte, error) {
+	var buf bytes.Buffer
+	if err := DecryptStream(bytes.NewReader(ciphertext), &buf, masterKey, path); err != nil {
+		return nil, err
 	}
-	if header == nil {
-		return nil, fmt.Errorf("crypto: header is nil")
-	}
-
-	block, err := aes.NewCipher(dek)
-	if err != nil {
-		return nil, fmt.Errorf("crypto: failed to create AES cipher: %w", err)
-	}
-
-	aead, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, fmt.Errorf("crypto: failed to create GCM: %w", err)
-	}
-
-	// Compute AAD = SHA-256(filePath)
-	aad := HashFilePath(filePath)
-
-	// Decrypt with AES-256-GCM
-	plaintext, err := aead.Open(nil, header.ContentNonce[:], ciphertext, aad)
-	if err != nil {
-		return nil, fmt.Errorf("crypto: failed to decrypt file content: %w", err)
-	}
-
-	return plaintext, nil
-}
-
-// ---------------------------------------------------------------------------
-// Full File Operations (combining header + ciphertext)
-// ---------------------------------------------------------------------------
-
-// EncryptBlob performs the full encryption pipeline on plaintext data:
-//  1. Generate a random DEK
-//  2. Encrypt the DEK with the master key
-//  3. Encrypt the file content with the DEK (using path-derived AAD)
-//  4. Build the file header (magic + version + encrypted DEK + DEK nonce + content nonce)
-//  5. Serialize the 80-byte header + ciphertext
-//  6. Return the complete encrypted blob
-func EncryptBlob(plaintext []byte, masterKey []byte, filePath string) ([]byte, error) {
-	if len(masterKey) != dekSize {
-		return nil, fmt.Errorf("crypto: master key must be %d bytes, got %d", dekSize, len(masterKey))
-	}
-
-	// Step 1: Generate DEK
-	dek, err := GenerateDEK()
-	if err != nil {
-		return nil, fmt.Errorf("crypto: encrypt blob: %w", err)
-	}
-	defer WipeBytes(dek)
-
-	// Step 2: Encrypt DEK with master key
-	encryptedDEK, dekNonce, err := EncryptDEK(dek, masterKey)
-	if err != nil {
-		return nil, fmt.Errorf("crypto: encrypt blob: %w", err)
-	}
-
-	// Step 3: Encrypt file content with DEK
-	header, ciphertext, err := EncryptFile(plaintext, dek, filePath)
-	if err != nil {
-		return nil, fmt.Errorf("crypto: encrypt blob: %w", err)
-	}
-
-	// Step 4: Fill in the remaining header fields
-	copy(header.EncryptedDEK[:], encryptedDEK)
-	copy(header.DEKNonce[:], dekNonce)
-
-	// Step 5: Serialize header + ciphertext
-	headerBytes, err := SerializeHeader(header)
-	if err != nil {
-		return nil, fmt.Errorf("crypto: encrypt blob: %w", err)
-	}
-
-	// Step 6: Combine header and ciphertext
-	blob := make([]byte, 0, len(headerBytes)+len(ciphertext))
-	blob = append(blob, headerBytes...)
-	blob = append(blob, ciphertext...)
-
-	return blob, nil
-}
-
-// DecryptBlob performs the full decryption pipeline on an encrypted blob:
-//  1. Parse and validate the 80-byte header (check magic bytes, version)
-//  2. Extract encrypted DEK, DEK nonce, and content nonce from the header
-//  3. Decrypt the DEK using the master key
-//  4. Decrypt the file content using the DEK and path-derived AAD
-//  5. Return the plaintext
-func DecryptBlob(blob []byte, masterKey []byte, filePath string) ([]byte, error) {
-	if len(masterKey) != dekSize {
-		return nil, fmt.Errorf("crypto: master key must be %d bytes, got %d", dekSize, len(masterKey))
-	}
-	if len(blob) < models.HeaderSize {
-		return nil, fmt.Errorf("crypto: blob too short (%d bytes, minimum %d)", len(blob), models.HeaderSize)
-	}
-
-	// Step 1: Parse and validate header
-	header, err := DeserializeHeader(blob[:models.HeaderSize])
-	if err != nil {
-		return nil, fmt.Errorf("crypto: decrypt blob: %w", err)
-	}
-
-	// Step 2: Extract fields from header (already done by DeserializeHeader)
-	encryptedDEK := header.EncryptedDEK[:]
-	dekNonce := header.DEKNonce[:]
-
-	// Step 3: Decrypt DEK with master key
-	dek, err := DecryptDEK(encryptedDEK, dekNonce, masterKey)
-	if err != nil {
-		return nil, fmt.Errorf("crypto: decrypt blob: %w", err)
-	}
-	defer WipeBytes(dek)
-
-	// Step 4: Decrypt content with DEK
-	ciphertext := blob[models.HeaderSize:]
-	plaintext, err := DecryptFile(ciphertext, header, dek, filePath)
-	if err != nil {
-		return nil, fmt.Errorf("crypto: decrypt blob: %w", err)
-	}
-
-	// Step 5: Return plaintext
-	return plaintext, nil
+	return buf.Bytes(), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -381,12 +231,10 @@ func DeserializeHeader(data []byte) (*models.EncryptedFileHeader, error) {
 		return nil, fmt.Errorf("crypto: invalid magic bytes %q, expected %q", string(header.Magic[:]), models.Magic)
 	}
 
-	// [6:8] Version (little-endian uint16). Accept both the single-blob version
-	// and the v2 stream version; the consumer (DecryptBlob vs DecryptStream)
-	// interprets the body accordingly.
+	// [6:8] Version (little-endian uint16).
 	header.Version = binary.LittleEndian.Uint16(data[6:8])
-	if header.Version != models.CurrentVersion && header.Version != models.CurrentStreamVersion {
-		return nil, fmt.Errorf("crypto: unsupported version %d", header.Version)
+	if header.Version != models.CurrentStreamVersion {
+		return nil, fmt.Errorf("crypto: unsupported version %d, expected %d", header.Version, models.CurrentStreamVersion)
 	}
 
 	// [8:56] Encrypted DEK (48 bytes)
@@ -424,23 +272,17 @@ func streamChunkNonce(contentNonce []byte, chunkIndex uint64) []byte {
 	return nonce
 }
 
-// streamChunkAAD builds the additional authenticated data for a chunk. For v1
-// streams it is baseAAD || chunkIndex. For v2 streams a trailing "final" byte is
-// appended so the position of the last chunk — and therefore the chunk count —
-// is authenticated, defeating truncation and extension of the chunk sequence.
-func streamChunkAAD(baseAAD []byte, chunkIndex uint64, version uint16, final bool) []byte {
-	if version >= models.CurrentStreamVersion {
-		aad := make([]byte, 32+8+1)
-		copy(aad[0:32], baseAAD)
-		binary.LittleEndian.PutUint64(aad[32:40], chunkIndex)
-		if final {
-			aad[40] = 1
-		}
-		return aad
-	}
-	aad := make([]byte, 32+8)
+// streamChunkAAD builds the additional authenticated data for a chunk:
+// baseAAD || chunkIndex || finalByte. The trailing "final" byte authenticates
+// the position of the last chunk — and therefore the chunk count — defeating
+// truncation and extension of the chunk sequence.
+func streamChunkAAD(baseAAD []byte, chunkIndex uint64, final bool) []byte {
+	aad := make([]byte, 32+8+1)
 	copy(aad[0:32], baseAAD)
-	binary.LittleEndian.PutUint64(aad[32:], chunkIndex)
+	binary.LittleEndian.PutUint64(aad[32:40], chunkIndex)
+	if final {
+		aad[40] = 1
+	}
 	return aad
 }
 
@@ -514,7 +356,7 @@ func EncryptStream(src io.Reader, dst io.Writer, masterKey []byte, filePath stri
 		final := nextN == 0
 
 		nonce := streamChunkNonce(contentNonce, chunkIndex)
-		aad := streamChunkAAD(baseAAD, chunkIndex, models.CurrentStreamVersion, final)
+		aad := streamChunkAAD(baseAAD, chunkIndex, final)
 		ciphertext := aead.Seal(nil, nonce, cur[:curN], aad)
 		if _, err := dst.Write(ciphertext); err != nil {
 			return err
@@ -531,10 +373,11 @@ func EncryptStream(src io.Reader, dst io.Writer, masterKey []byte, filePath stri
 	return nil
 }
 
-// DecryptStream decrypts data from src and writes it to dst in chunks. It reads
-// the header version and handles both the v2 format (which authenticates the
-// chunk count via a per-chunk final marker, rejecting truncation/extension) and
-// the legacy v1 format (no final marker) for backward compatibility.
+// DecryptStream decrypts a v2 stream written by EncryptStream. It uses one
+// chunk of read-ahead so it knows which chunk should carry the final marker; a
+// ciphertext truncated or extended at a chunk boundary makes the computed final
+// flag disagree with what was sealed, so Open fails and the tampering is
+// detected.
 func DecryptStream(src io.Reader, dst io.Writer, masterKey []byte, filePath string) error {
 	// 1. Read and parse header
 	headerBytes := make([]byte, models.HeaderSize)
@@ -567,17 +410,6 @@ func DecryptStream(src io.Reader, dst io.Writer, masterKey []byte, filePath stri
 	baseAAD := HashFilePath(filePath)
 	contentNonce := header.ContentNonce[:]
 
-	if header.Version >= models.CurrentStreamVersion {
-		return decryptStreamV2(src, dst, aead, baseAAD, contentNonce)
-	}
-	return decryptStreamV1(src, dst, aead, baseAAD, contentNonce)
-}
-
-// decryptStreamV2 decrypts a v2 stream, using one chunk of read-ahead so it
-// knows which chunk should carry the final marker. A ciphertext truncated or
-// extended at a chunk boundary makes the computed final flag disagree with what
-// was sealed, so Open fails and the tampering is detected.
-func decryptStreamV2(src io.Reader, dst io.Writer, aead cipher.AEAD, baseAAD, contentNonce []byte) error {
 	cur := make([]byte, EncryptedChunkSize)
 	next := make([]byte, EncryptedChunkSize)
 	curN, err := io.ReadFull(src, cur)
@@ -600,7 +432,7 @@ func decryptStreamV2(src io.Reader, dst io.Writer, aead cipher.AEAD, baseAAD, co
 		}
 
 		nonce := streamChunkNonce(contentNonce, chunkIndex)
-		aad := streamChunkAAD(baseAAD, chunkIndex, models.CurrentStreamVersion, final)
+		aad := streamChunkAAD(baseAAD, chunkIndex, final)
 		plaintext, oerr := aead.Open(nil, nonce, cur[:curN], aad)
 		if oerr != nil {
 			return fmt.Errorf("crypto: decrypt chunk %d: %w", chunkIndex, oerr)
@@ -615,37 +447,6 @@ func decryptStreamV2(src io.Reader, dst io.Writer, aead cipher.AEAD, baseAAD, co
 		}
 		cur, next = next, cur
 		curN = nextN
-	}
-
-	return nil
-}
-
-// decryptStreamV1 decrypts a legacy v1 stream, which has no final-chunk marker.
-func decryptStreamV1(src io.Reader, dst io.Writer, aead cipher.AEAD, baseAAD, contentNonce []byte) error {
-	ciphertext := make([]byte, EncryptedChunkSize)
-	chunkIndex := uint64(0)
-
-	for {
-		n, err := io.ReadFull(src, ciphertext)
-		if n > 0 {
-			nonce := streamChunkNonce(contentNonce, chunkIndex)
-			aad := streamChunkAAD(baseAAD, chunkIndex, models.CurrentVersion, false)
-			plaintext, oerr := aead.Open(nil, nonce, ciphertext[:n], aad)
-			if oerr != nil {
-				return oerr
-			}
-			if _, werr := dst.Write(plaintext); werr != nil {
-				return werr
-			}
-			chunkIndex++
-		}
-
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			break
-		}
-		if err != nil {
-			return err
-		}
 	}
 
 	return nil

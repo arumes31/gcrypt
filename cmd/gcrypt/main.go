@@ -80,6 +80,20 @@ func main() {
 	}
 	defer func() { _ = logger.Close() }()
 
+	// Apply persisted logging settings (level + rotation) so the configured
+	// values take effect from startup, not just after a runtime change.
+	if cfg != nil {
+		if cfg.App.LogLevel != "" {
+			logger.SetLevel(cfg.App.LogLevel)
+		}
+		if cfg.App.LogMaxSize > 0 {
+			logger.SetMaxSize(int64(cfg.App.LogMaxSize) * 1024 * 1024)
+		}
+		if cfg.App.LogMaxBackups >= 1 {
+			logger.SetMaxBackups(cfg.App.LogMaxBackups)
+		}
+	}
+
 	logger.Info("gcrypt starting", map[string]interface{}{
 		"version": Version,
 	})

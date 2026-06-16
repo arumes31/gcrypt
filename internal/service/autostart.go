@@ -27,7 +27,10 @@ func EnableAutoStart() error {
 	}
 	defer func() { _ = key.Close() }()
 
-	if err := key.SetStringValue(autostartValueName, exePath); err != nil {
+	// Quote the path so Windows parses it correctly when the executable lives in
+	// a directory containing spaces (e.g. "C:\Program Files\..."). An unquoted
+	// path with spaces can be misinterpreted by the Run-key launcher.
+	if err := key.SetStringValue(autostartValueName, `"`+exePath+`"`); err != nil {
 		return fmt.Errorf("service: set registry value: %w", err)
 	}
 

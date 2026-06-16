@@ -239,9 +239,8 @@ type TrayApp struct {
 	mSettings *systray.MenuItem
 
 	// Settings submenu items
-	mAutoStart      *systray.MenuItem
-	mStartMinimized *systray.MenuItem
-	mRememberPass   *systray.MenuItem
+	mAutoStart    *systray.MenuItem
+	mRememberPass *systray.MenuItem
 
 	// Radio groups for settings
 	syncIntervalGroup  *radioGroup
@@ -409,7 +408,6 @@ func (t *TrayApp) onReady() {
 
 	// Start settings checkbox handlers
 	go t.handleAutoStartLoop()
-	go t.handleStartMinimizedLoop()
 	go t.handleRememberPassphraseLoop()
 
 	// Add Sync Pair handler
@@ -1291,7 +1289,6 @@ func (t *TrayApp) buildSettingsSubmenu() {
 	mGeneral := t.mSettings.AddSubMenuItem("🖥️ General", "General settings")
 
 	t.mAutoStart = mGeneral.AddSubMenuItemCheckbox("Auto Start", "Start gcrypt on Windows boot", cfg.App.AutoStart)
-	t.mStartMinimized = mGeneral.AddSubMenuItemCheckbox("Start Minimized", "Start gcrypt without showing a console window", cfg.App.StartMinimized)
 	t.mRememberPass = mGeneral.AddSubMenuItemCheckbox("Remember Passphrase", "Securely store your passphrase (Windows DPAPI) to auto-unlock on startup", cfg.App.RememberPassphrase)
 
 	// --- Sync ------------------------------------------------------------
@@ -1568,26 +1565,6 @@ func (t *TrayApp) handleRememberPassphraseLoop() {
 	}
 }
 
-// handleStartMinimizedLoop handles the start-minimized checkbox toggle.
-func (t *TrayApp) handleStartMinimizedLoop() {
-	for range t.mStartMinimized.ClickedCh {
-		t.mu.Lock()
-		cfg := t.ctrl.Config()
-		if cfg == nil {
-			t.mu.Unlock()
-			continue
-		}
-		cfg.App.StartMinimized = !cfg.App.StartMinimized
-		if cfg.App.StartMinimized {
-			t.mStartMinimized.Check()
-		} else {
-			t.mStartMinimized.Uncheck()
-		}
-		_ = config.Save(config.ConfigPath(), cfg)
-		t.mu.Unlock()
-	}
-}
-
 // handleSyncInterval updates the sync interval for all pairs.
 func (t *TrayApp) handleSyncInterval(secs int) {
 	t.mu.Lock()
@@ -1662,9 +1639,10 @@ func (t *TrayApp) handleLogLevel(level string) {
 	}
 
 	cfg.App.LogLevel = level
+	if t.logger != nil {
+		t.logger.SetLevel(level)
+	}
 	_ = config.Save(config.ConfigPath(), cfg)
-	// Note: runtime log level change would need a method on the logger.
-	// This is a config-only change for now; it takes effect on restart.
 }
 
 // handleLogMaxSize updates the log max size setting and applies it at runtime.

@@ -164,57 +164,10 @@ func TestEncryptDecryptDEK(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// TestEncryptDecryptFile — File content encryption/decryption
+// TestEncryptDecryptStream — Streaming round-trip across sizes
 // ---------------------------------------------------------------------------
 
-func TestEncryptDecryptFile(t *testing.T) {
-	// Generate a DEK.
-	dek, err := GenerateDEK()
-	if err != nil {
-		t.Fatalf("GenerateDEK failed: %v", err)
-	}
-
-	plaintext := []byte("hello world")
-	filePath := "test/file.txt"
-
-	// Encrypt "hello world" with DEK and path.
-	header, ciphertext, err := EncryptFile(plaintext, dek, filePath)
-	if err != nil {
-		t.Fatalf("EncryptFile failed: %v", err)
-	}
-
-	// Verify header is populated correctly.
-	if string(header.Magic[:]) != models.Magic {
-		t.Errorf("expected magic %q, got %q", models.Magic, string(header.Magic[:]))
-	}
-	if header.Version != models.CurrentVersion {
-		t.Errorf("expected version %d, got %d", models.CurrentVersion, header.Version)
-	}
-
-	// Decrypt with same DEK and path.
-	decrypted, err := DecryptFile(ciphertext, header, dek, filePath)
-	if err != nil {
-		t.Fatalf("DecryptFile failed: %v", err)
-	}
-
-	// Verify plaintext matches.
-	if !bytes.Equal(plaintext, decrypted) {
-		t.Errorf("decrypted plaintext does not match: got %q, want %q", decrypted, plaintext)
-	}
-
-	// Verify wrong path (different AAD) fails to decrypt.
-	_, err = DecryptFile(ciphertext, header, dek, "wrong/path.txt")
-	if err == nil {
-		t.Error("expected error when decrypting with wrong path (different AAD), got nil")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// TestEncryptDecryptBlob — Full blob encryption/decryption
-// ---------------------------------------------------------------------------
-
-func TestEncryptDecryptBlob(t *testing.T) {
-	// Derive master key from passphrase.
+func TestEncryptDecryptStream(t *testing.T) {
 	salt, err := GenerateSalt()
 	if err != nil {
 		t.Fatalf("GenerateSalt failed: %v", err)
@@ -224,43 +177,112 @@ func TestEncryptDecryptBlob(t *testing.T) {
 		t.Fatalf("DeriveMasterKey failed: %v", err)
 	}
 
-	// Encrypt a larger plaintext (1KB of data).
-	plaintext := bytes.Repeat([]byte("A"), 1024)
 	filePath := "docs/report.pdf"
+	sizes := []int{0, 1, 100, ChunkSize - 1, ChunkSize, ChunkSize + 1, 3*ChunkSize + 7}
+	for _, size := range sizes {
+		plaintext := bytes.Repeat([]byte("A"), size)
 
-	blob, err := EncryptBlob(plaintext, masterKey, filePath)
+		var ct bytes.Buffer
+		if err := EncryptStream(bytes.NewReader(plaintext), &ct, masterKey, filePath); err != nil {
+			t.Fatalf("EncryptStream(size=%d) failed: %v", size, err)
+		}
+
+		var pt bytes.Buffer
+		if err := DecryptStream(bytes.NewReader(ct.Bytes()), &pt, masterKey, filePath); err != nil {
+			t.Fatalf("DecryptStream(size=%d) failed: %v", size, err)
+		}
+		if !bytes.Equal(plaintext, pt.Bytes()) {
+			t.Errorf("round-trip mismatch at size=%d", size)
+		}
+
+		// Wrong path (different AAD) must fail.
+		var bad bytes.Buffer
+		if err := DecryptStream(bytes.NewReader(ct.Bytes()), &bad, masterKey, "wrong/path"); err == nil {
+			t.Errorf("expected decrypt failure with wrong path at size=%d", size)
+		}
+
+		// Wrong key must fail.
+		wrongKey, _ := DeriveMasterKey("wrong", salt)
+		var bad2 bytes.Buffer
+		if err := DecryptStream(bytes.NewReader(ct.Bytes()), &bad2, wrongKey, filePath); err == nil {
+			t.Errorf("expected decrypt failure with wrong key at size=%d", size)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestDecryptStreamTamperDetected — v2 final-chunk authentication
+// ---------------------------------------------------------------------------
+
+func TestDecryptStreamTamperDetected(t *testing.T) {
+	salt, _ := GenerateSalt()
+	masterKey, _ := DeriveMasterKey("pw", salt)
+	filePath := "a/b/c.bin"
+
+	// Exact multiple of ChunkSize so every chunk is a full EncryptedChunkSize.
+	plaintext := bytes.Repeat([]byte("X"), 3*ChunkSize)
+	var ct bytes.Buffer
+	if err := EncryptStream(bytes.NewReader(plaintext), &ct, masterKey, filePath); err != nil {
+		t.Fatalf("EncryptStream failed: %v", err)
+	}
+	full := ct.Bytes()
+
+	// Dropping the final chunk must be detected (the new last chunk was sealed
+	// as non-final).
+	truncated := full[:len(full)-EncryptedChunkSize]
+	var out bytes.Buffer
+	if err := DecryptStream(bytes.NewReader(truncated), &out, masterKey, filePath); err == nil {
+		t.Fatal("expected truncated stream to fail decryption, got nil error")
+	}
+
+	// Appending a bogus extra chunk must be detected (the real final chunk was
+	// sealed as final, but now has data after it).
+	extended := append(append([]byte{}, full...), make([]byte, EncryptedChunkSize)...)
+	var out2 bytes.Buffer
+	if err := DecryptStream(bytes.NewReader(extended), &out2, masterKey, filePath); err == nil {
+		t.Fatal("expected extended stream to fail decryption, got nil error")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestEncryptDecryptBytes — small in-memory helper round-trip
+// ---------------------------------------------------------------------------
+
+func TestEncryptDecryptBytes(t *testing.T) {
+	salt, err := GenerateSalt()
 	if err != nil {
-		t.Fatalf("EncryptBlob failed: %v", err)
+		t.Fatalf("GenerateSalt failed: %v", err)
 	}
-
-	// Verify blob starts with magic bytes "GCRYPT".
-	if len(blob) < 6 || string(blob[:6]) != "GCRYPT" {
-		t.Errorf("blob does not start with magic bytes %q", "GCRYPT")
-	}
-
-	// Verify blob is at least 80 bytes (header size).
-	if len(blob) < models.HeaderSize {
-		t.Errorf("blob is too short: %d bytes, minimum %d", len(blob), models.HeaderSize)
-	}
-
-	// Decrypt the blob with same master key and path.
-	decrypted, err := DecryptBlob(blob, masterKey, filePath)
+	masterKey, err := DeriveMasterKey("testpassphrase", salt)
 	if err != nil {
-		t.Fatalf("DecryptBlob failed: %v", err)
+		t.Fatalf("DeriveMasterKey failed: %v", err)
 	}
 
-	// Verify plaintext matches original.
+	plaintext := bytes.Repeat([]byte("A"), 1024)
+	path := "gcrypt://oauth-token"
+
+	ct, err := EncryptBytes(plaintext, masterKey, path)
+	if err != nil {
+		t.Fatalf("EncryptBytes failed: %v", err)
+	}
+	if len(ct) < 6 || string(ct[:6]) != models.Magic {
+		t.Errorf("ciphertext does not start with magic bytes %q", models.Magic)
+	}
+
+	decrypted, err := DecryptBytes(ct, masterKey, path)
+	if err != nil {
+		t.Fatalf("DecryptBytes failed: %v", err)
+	}
 	if !bytes.Equal(plaintext, decrypted) {
 		t.Error("decrypted plaintext does not match original")
 	}
 
-	// Verify wrong passphrase fails.
+	// Wrong key must fail.
 	wrongKey, err := DeriveMasterKey("wrongpassphrase", salt)
 	if err != nil {
 		t.Fatalf("DeriveMasterKey (wrong passphrase) failed: %v", err)
 	}
-	_, err = DecryptBlob(blob, wrongKey, filePath)
-	if err == nil {
+	if _, err := DecryptBytes(ct, wrongKey, path); err == nil {
 		t.Error("expected error when decrypting with wrong passphrase, got nil")
 	}
 }
@@ -273,7 +295,7 @@ func TestSerializeDeserializeHeader(t *testing.T) {
 	// Create an EncryptedFileHeader with known values.
 	header := &models.EncryptedFileHeader{}
 	copy(header.Magic[:], models.Magic)
-	header.Version = models.CurrentVersion
+	header.Version = models.CurrentStreamVersion
 	// Fill remaining fields with test data.
 	for i := 0; i < len(header.EncryptedDEK); i++ {
 		header.EncryptedDEK[i] = byte(i)
