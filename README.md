@@ -427,7 +427,7 @@ For security-related issues, please refer to our [Security Policy](SECURITY.md).
 ---
 
 ## License
-MIT License - Copyright (c) 2024 gcrypt contributors
+MIT License - Copyright (c) 2026 gcrypt contributors
 
 ---
 
@@ -436,4 +436,4 @@ For issues and feature requests, please [open an issue](https://github.com/youru
 Join our [Discord server](https://discord.gg/gcrypt) for real-time help.
 
 ---
-*gcrypt v2.0.0 - The encrypted Google Drive sync client for Windows*
+*gcrypt v0.1 - The encrypted Google Drive sync client for Windows*
