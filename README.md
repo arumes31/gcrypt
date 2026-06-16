@@ -291,6 +291,12 @@ Your encrypted files in Google Drive can **only** be decrypted with the master k
 Master Key = Argon2id(passphrase, salt)
 ```
 
+> [!WARNING]
+> **CRITICAL: BACK UP YOUR SALT AND PASSPHRASE!**
+> Because `gcrypt` derives the master key locally from both your passphrase and `salt.bin` (which is never uploaded to Google Drive for security reasons), you **MUST** back up both your **passphrase** and the **`salt.bin`** file.
+> 
+> If you lose both your passphrase and your `salt.bin` file, **YOUR ENCRYPTED DATA CAN NEVER BE RECOVERED**. There is no password reset, recovery key, or back door. Keep a copy of `salt.bin` in a safe, offline location (like a USB drive or password manager).
+
 The salt is generated once, on the PC where you first set up the sync, and is stored locally at `%APPDATA%\gcrypt\salt.bin`. **It is never uploaded to Google Drive.** This means a second computer cannot simply install gcrypt and run a normal setup — doing so would generate a *different* salt, derive a *different* master key, and fail to decrypt anything in the cloud.
 
 To use the same encrypted sync on another PC you must **import the original salt and identity**. gcrypt's setup has a built‑in path for this.
