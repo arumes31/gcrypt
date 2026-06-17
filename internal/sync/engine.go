@@ -15,6 +15,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/sync/singleflight"
+
 	"github.com/arumes31/gcrypt/internal/appstate"
 	"github.com/arumes31/gcrypt/internal/config"
 	"github.com/arumes31/gcrypt/internal/crypto"
@@ -157,6 +159,10 @@ type Engine struct {
 	// sync root ("") is always the pair's Drive folder and is resolved directly.
 	folderCache map[string]string
 	folderMu    sync.Mutex
+	// folderGroup deduplicates concurrent resolution/creation of the same remote
+	// directory so parallel uploads never create duplicate Drive folders, while
+	// still allowing different directories to be created concurrently.
+	folderGroup singleflight.Group
 
 	// syncNowCh is used by SyncNow() to trigger an immediate full scan.
 	syncNowCh chan struct{}
@@ -182,8 +188,19 @@ func WithMaxRetries(n int) EngineOption {
 	return func(e *Engine) { e.maxRetries = n }
 }
 
-// WithWorkers sets the number of concurrent worker goroutines. The default
-// is 3.
+// defaultWorkers is the number of concurrent upload/download worker goroutines
+// per engine when not overridden by app.upload_workers. Uploads run in parallel
+// (the Drive client is concurrency-safe), so this directly drives throughput for
+// large numbers of small files.
+const defaultWorkers = 8
+
+// maxRequestsPerSec caps the per-engine Drive request rate so a high worker
+// count can't hammer the API past its per-user limits.
+const maxRequestsPerSec = 100
+
+// WithWorkers sets the number of concurrent worker goroutines, overriding the
+// default. Note: the request-rate limiter is sized from the worker count at
+// construction, so prefer app.upload_workers for production tuning.
 func WithWorkers(n int) EngineOption {
 	return func(e *Engine) { e.workers = n }
 }
@@ -221,6 +238,21 @@ func NewEngine(pair *config.SyncPair, appCfg *config.AppConfig, driveClient *dri
 	// Create scanner for the sync directory.
 	scanner := NewScanner(pair.LocalDir, pair.EffectiveIgnorePatterns(), pair.SelectedFolders)
 
+	// Concurrency: uploads now run in parallel (the Drive client is no longer
+	// serialised), so the worker count is the main throughput lever — important
+	// for syncing large trees of small files. Tunable via app.upload_workers.
+	workers := defaultWorkers
+	if appCfg.UploadWorkers > 0 {
+		workers = appCfg.UploadWorkers
+	}
+	// Size the request-rate limiter so it does not throttle below the worker
+	// concurrency, while still capping bursts to stay clear of Drive's per-user
+	// rate limits (429s are retried with backoff regardless).
+	reqPerSec := workers * 10
+	if reqPerSec > maxRequestsPerSec {
+		reqPerSec = maxRequestsPerSec
+	}
+
 	e := &Engine{
 		pair:          pair,
 		appCfg:        appCfg,
@@ -238,8 +270,8 @@ func NewEngine(pair *config.SyncPair, appCfg *config.AppConfig, driveClient *dri
 		syncNowCh:     make(chan struct{}, 1),
 		OnError:       make(chan error, 64),
 		maxRetries:    5,
-		workers:       3,
-		rateLimiter:   time.NewTicker(100 * time.Millisecond), // ~10 req/s
+		workers:       workers,
+		rateLimiter:   time.NewTicker(time.Second / time.Duration(reqPerSec)),
 	}
 
 	// Apply functional options.
@@ -885,6 +917,17 @@ func (e *Engine) runWorker(id int) {
 				op.Attempts++
 				op.LastError = err.Error()
 
+				// Surface the failure so a stalled/looping sync isn't silent. Per
+				// attempt is a WARN; the terminal give-up below is reported via the
+				// error channel.
+				opPath := ""
+				if op.File != nil {
+					opPath = op.File.LocalPath
+				}
+				slog.Warn("sync operation failed; scheduling retry",
+					"op", op.OpType, "file", opPath,
+					"attempt", op.Attempts, "max", op.MaxAttempts, "error", err)
+
 				if op.Attempts < op.MaxAttempts {
 					// Retry with exponential backoff. The operation is still
 					// pending, so the backlog counter is left untouched until it
@@ -1493,40 +1536,49 @@ func (e *Engine) resolveRemoteDir(relDir string) (string, error) {
 		return e.pair.DriveFolderID, nil
 	}
 
+	// Fast path: already resolved/cached.
 	e.folderMu.Lock()
-	defer e.folderMu.Unlock()
-
-	if id, ok := e.folderCache[slashDir]; ok {
-		return id, nil
+	cached, ok := e.folderCache[slashDir]
+	e.folderMu.Unlock()
+	if ok {
+		return cached, nil
 	}
 
-	parentID := e.pair.DriveFolderID
-	cum := ""
-	for _, comp := range strings.Split(slashDir, "/") {
-		if comp == "" {
-			continue
+	// Resolve (creating as needed) under singleflight keyed by the directory
+	// path. Concurrent uploads into the same new directory share one resolution
+	// — so no duplicate Drive folders are created — while uploads into different
+	// directories resolve in parallel. The parent is resolved recursively (also
+	// via singleflight), so only the single missing component is created here.
+	v, err, _ := e.folderGroup.Do(slashDir, func() (interface{}, error) {
+		e.folderMu.Lock()
+		id, ok := e.folderCache[slashDir]
+		e.folderMu.Unlock()
+		if ok {
+			return id, nil
 		}
-		if cum == "" {
-			cum = comp
-		} else {
-			cum += "/" + comp
+
+		parentID, err := e.resolveRemoteDir(path.Dir(slashDir))
+		if err != nil {
+			return "", err
 		}
-		if id, ok := e.folderCache[cum]; ok {
-			parentID = id
-			continue
-		}
+		comp := path.Base(slashDir)
 		encName, err := crypto.EncryptFilename(comp, e.masterKey)
 		if err != nil {
 			return "", fmt.Errorf("encrypt dir component %q: %w", comp, err)
 		}
-		id, err := e.driveClient.EnsureFolderUnder(e.ctx, parentID, encName)
+		childID, err := e.driveClient.EnsureFolderUnder(e.ctx, parentID, encName)
 		if err != nil {
-			return "", fmt.Errorf("ensure remote folder %q: %w", cum, err)
+			return "", fmt.Errorf("ensure remote folder %q: %w", slashDir, err)
 		}
-		e.folderCache[cum] = id
-		parentID = id
+		e.folderMu.Lock()
+		e.folderCache[slashDir] = childID
+		e.folderMu.Unlock()
+		return childID, nil
+	})
+	if err != nil {
+		return "", err
 	}
-	return parentID, nil
+	return v.(string), nil
 }
 
 // cacheRemoteDir records the Drive folder ID for a plaintext relative directory

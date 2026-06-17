@@ -314,7 +314,7 @@ func (f *FyneApp) refresh() {
 	}
 
 	// Summary line + activity feed (only meaningful once syncing).
-	f.refreshSummary()
+	f.refreshSummary(state)
 	f.refreshActivity()
 
 	// State-driven CTA.
@@ -343,8 +343,10 @@ func (f *FyneApp) setCTA(label string, fn func()) {
 }
 
 // refreshSummary updates the folder line, cumulative counters + live transfer
-// rate, and the in-flight ("currently syncing") line.
-func (f *FyneApp) refreshSummary() {
+// rate, and the in-flight ("currently syncing") line. It also refines the header
+// status to reflect what is actually happening (e.g. "Uploading…") rather than
+// the coarse engine state, which stays "Scanning" for the whole streaming scan.
+func (f *FyneApp) refreshSummary(state appstate.State) {
 	cfg := f.ctrl.Config()
 	dir := ""
 	if cfg != nil {
@@ -378,6 +380,22 @@ func (f *FyneApp) refreshSummary() {
 
 	// Compute a smoothed transfer rate from byte deltas since the last refresh.
 	f.updateRates(bytesUp, bytesDown)
+
+	// Refine the header status: while the engine is connecting/scanning/syncing,
+	// what the user actually cares about is whether files are moving. The initial
+	// scan of a large tree streams for a long time (state stays "Scanning") even
+	// though uploads are already running, so show "Uploading…"/"Downloading…"
+	// whenever there is in-flight or queued transfer work.
+	if active > 0 || pending > 0 {
+		switch state {
+		case appstate.Connecting, appstate.Scanning, appstate.Syncing, appstate.Idle:
+			if f.rateDown > f.rateUp {
+				f.statusLabel.SetText("Downloading…")
+			} else {
+				f.statusLabel.SetText("Uploading…")
+			}
+		}
+	}
 
 	metrics := fmt.Sprintf("↑ %d files (%s)   ·   ↓ %d files (%s)",
 		upFiles, humanBytes(bytesUp), downFiles, humanBytes(bytesDown))

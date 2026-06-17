@@ -90,6 +90,7 @@ type AppConfig struct {
 	MaxFileSize        int64  `yaml:"max_file_size"`
 	RateLimitUpKBps    int    `yaml:"rate_limit_up_kbps"`   // 0 = unlimited
 	RateLimitDownKBps  int    `yaml:"rate_limit_down_kbps"` // 0 = unlimited
+	UploadWorkers      int    `yaml:"upload_workers"`       // 0 = use default; concurrent uploads per pair
 }
 
 // Config is the top-level V2 configuration.
