@@ -364,7 +364,15 @@ app:
   auto_start: true
   log_level: "info"
   max_file_size: 104857600
+  upload_workers: 8   # concurrent uploads per sync pair (0 = default of 8)
 ```
+
+> **Throughput tuning (`upload_workers`)**: uploads run in parallel, so syncing
+> large trees of small files (e.g. `node_modules`) is bound by how many files are
+> uploaded concurrently. The default is 8 workers per pair; raise it (e.g. 16) on
+> a fast connection for more parallelism, or lower it if you hit Google Drive rate
+> limits. The per-pair request rate is capped automatically to stay within Drive's
+> per-user quota (rate-limited requests are retried with backoff).
 
 ### Remote Layout
 
@@ -374,9 +382,8 @@ encrypted directory name, and each file is stored under its encrypted parent
 folder with only its (encrypted) basename. This preserves folder structure
 remotely while keeping everything encrypted, and prevents any single Drive folder
 from growing without bound. Folder IDs are cached in memory and created on demand.
-
-> ℹ️ Deleting files leaves now-empty encrypted folders behind on Drive (they are
-> harmless); automatic empty-folder cleanup is not yet implemented.
+When a deletion empties an encrypted folder, gcrypt removes it (and any newly
+empty parent folders) from Drive automatically.
 
 ---
 

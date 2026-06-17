@@ -11,6 +11,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 
@@ -88,6 +89,12 @@ func main() {
 	// be silently lost and the flyout window would just fail to appear.
 	log.SetFlags(0)
 	log.SetOutput(logger.Writer())
+
+	// The sync engine logs via slog (warnings about failed/retried operations,
+	// dropped errors, etc.). Its default handler writes to os.Stderr, which the
+	// windowsgui build discards — route it into the log file so those diagnostics
+	// are captured.
+	slog.SetDefault(slog.New(slog.NewTextHandler(logger.Writer(), &slog.HandlerOptions{Level: slog.LevelInfo})))
 
 	// Apply persisted logging settings (level + rotation) so the configured
 	// values take effect from startup, not just after a runtime change.

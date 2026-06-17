@@ -15,6 +15,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/sync/singleflight"
+
 	"github.com/arumes31/gcrypt/internal/appstate"
 	"github.com/arumes31/gcrypt/internal/config"
 	"github.com/arumes31/gcrypt/internal/crypto"
@@ -157,6 +159,10 @@ type Engine struct {
 	// sync root ("") is always the pair's Drive folder and is resolved directly.
 	folderCache map[string]string
 	folderMu    sync.Mutex
+	// folderGroup deduplicates concurrent resolution/creation of the same remote
+	// directory so parallel uploads never create duplicate Drive folders, while
+	// still allowing different directories to be created concurrently.
+	folderGroup singleflight.Group
 
 	// syncNowCh is used by SyncNow() to trigger an immediate full scan.
 	syncNowCh chan struct{}
@@ -182,8 +188,19 @@ func WithMaxRetries(n int) EngineOption {
 	return func(e *Engine) { e.maxRetries = n }
 }
 
-// WithWorkers sets the number of concurrent worker goroutines. The default
-// is 3.
+// defaultWorkers is the number of concurrent upload/download worker goroutines
+// per engine when not overridden by app.upload_workers. Uploads run in parallel
+// (the Drive client is concurrency-safe), so this directly drives throughput for
+// large numbers of small files.
+const defaultWorkers = 8
+
+// maxRequestsPerSec caps the per-engine Drive request rate so a high worker
+// count can't hammer the API past its per-user limits.
+const maxRequestsPerSec = 100
+
+// WithWorkers sets the number of concurrent worker goroutines, overriding the
+// default. Note: the request-rate limiter is sized from the worker count at
+// construction, so prefer app.upload_workers for production tuning.
 func WithWorkers(n int) EngineOption {
 	return func(e *Engine) { e.workers = n }
 }
@@ -221,6 +238,21 @@ func NewEngine(pair *config.SyncPair, appCfg *config.AppConfig, driveClient *dri
 	// Create scanner for the sync directory.
 	scanner := NewScanner(pair.LocalDir, pair.EffectiveIgnorePatterns(), pair.SelectedFolders)
 
+	// Concurrency: uploads now run in parallel (the Drive client is no longer
+	// serialised), so the worker count is the main throughput lever — important
+	// for syncing large trees of small files. Tunable via app.upload_workers.
+	workers := defaultWorkers
+	if appCfg.UploadWorkers > 0 {
+		workers = appCfg.UploadWorkers
+	}
+	// Size the request-rate limiter so it does not throttle below the worker
+	// concurrency, while still capping bursts to stay clear of Drive's per-user
+	// rate limits (429s are retried with backoff regardless).
+	reqPerSec := workers * 10
+	if reqPerSec > maxRequestsPerSec {
+		reqPerSec = maxRequestsPerSec
+	}
+
 	e := &Engine{
 		pair:          pair,
 		appCfg:        appCfg,
@@ -238,8 +270,8 @@ func NewEngine(pair *config.SyncPair, appCfg *config.AppConfig, driveClient *dri
 		syncNowCh:     make(chan struct{}, 1),
 		OnError:       make(chan error, 64),
 		maxRetries:    5,
-		workers:       3,
-		rateLimiter:   time.NewTicker(100 * time.Millisecond), // ~10 req/s
+		workers:       workers,
+		rateLimiter:   time.NewTicker(time.Second / time.Duration(reqPerSec)),
 	}
 
 	// Apply functional options.
@@ -885,6 +917,17 @@ func (e *Engine) runWorker(id int) {
 				op.Attempts++
 				op.LastError = err.Error()
 
+				// Surface the failure so a stalled/looping sync isn't silent. Per
+				// attempt is a WARN; the terminal give-up below is reported via the
+				// error channel.
+				opPath := ""
+				if op.File != nil {
+					opPath = op.File.LocalPath
+				}
+				slog.Warn("sync operation failed; scheduling retry",
+					"op", op.OpType, "file", opPath,
+					"attempt", op.Attempts, "max", op.MaxAttempts, "error", err)
+
 				if op.Attempts < op.MaxAttempts {
 					// Retry with exponential backoff. The operation is still
 					// pending, so the backlog counter is left untouched until it
@@ -1186,6 +1229,13 @@ func (e *Engine) deleteRemote(sf *models.SyncFile) error {
 	e.stats.FilesDeleted++
 	e.mu.Unlock()
 
+	// 4. Best-effort: remove now-empty encrypted parent folders on Drive so a
+	// deletion doesn't leave empty folders behind. Only meaningful when the file
+	// actually lived on Drive (had a RemoteID).
+	if sf.RemoteID != "" {
+		e.pruneEmptyRemoteDirs(path.Dir(filepath.ToSlash(sf.LocalPath)))
+	}
+
 	return nil
 }
 
@@ -1486,11 +1536,118 @@ func (e *Engine) resolveRemoteDir(relDir string) (string, error) {
 		return e.pair.DriveFolderID, nil
 	}
 
+	// Fast path: already resolved/cached.
 	e.folderMu.Lock()
-	defer e.folderMu.Unlock()
+	cached, ok := e.folderCache[slashDir]
+	e.folderMu.Unlock()
+	if ok {
+		return cached, nil
+	}
 
-	if id, ok := e.folderCache[slashDir]; ok {
-		return id, nil
+	// Resolve (creating as needed) under singleflight keyed by the directory
+	// path. Concurrent uploads into the same new directory share one resolution
+	// — so no duplicate Drive folders are created — while uploads into different
+	// directories resolve in parallel. The parent is resolved recursively (also
+	// via singleflight), so only the single missing component is created here.
+	v, err, _ := e.folderGroup.Do(slashDir, func() (interface{}, error) {
+		e.folderMu.Lock()
+		id, ok := e.folderCache[slashDir]
+		e.folderMu.Unlock()
+		if ok {
+			return id, nil
+		}
+
+		parentID, err := e.resolveRemoteDir(path.Dir(slashDir))
+		if err != nil {
+			return "", err
+		}
+		comp := path.Base(slashDir)
+		encName, err := crypto.EncryptFilename(comp, e.masterKey)
+		if err != nil {
+			return "", fmt.Errorf("encrypt dir component %q: %w", comp, err)
+		}
+		childID, err := e.driveClient.EnsureFolderUnder(e.ctx, parentID, encName)
+		if err != nil {
+			return "", fmt.Errorf("ensure remote folder %q: %w", slashDir, err)
+		}
+		e.folderMu.Lock()
+		e.folderCache[slashDir] = childID
+		e.folderMu.Unlock()
+		return childID, nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return v.(string), nil
+}
+
+// cacheRemoteDir records the Drive folder ID for a plaintext relative directory
+// (slash-separated) discovered while walking the remote tree.
+func (e *Engine) cacheRemoteDir(relDir, folderID string) {
+	e.folderMu.Lock()
+	e.folderCache[relDir] = folderID
+	e.folderMu.Unlock()
+}
+
+// uncacheRemoteDir drops a plaintext relative directory from the folder cache,
+// used after its remote folder has been deleted.
+func (e *Engine) uncacheRemoteDir(slashDir string) {
+	e.folderMu.Lock()
+	delete(e.folderCache, slashDir)
+	e.folderMu.Unlock()
+}
+
+// pruneEmptyRemoteDirs removes now-empty encrypted folders on Drive, walking up
+// from relDir toward the sync root, so deletions don't leave empty folders
+// behind. It is best-effort: any error simply stops the walk (a leftover empty
+// folder is harmless and a later deletion will retry). The pair's root Drive
+// folder is never removed.
+func (e *Engine) pruneEmptyRemoteDirs(relDir string) {
+	slashDir := path.Clean(filepath.ToSlash(relDir))
+	for slashDir != "." && slashDir != "/" && slashDir != "" {
+		id, ok := e.lookupRemoteDirID(slashDir)
+		if !ok || id == e.pair.DriveFolderID {
+			return
+		}
+		empty, err := e.driveFolderIsEmpty(id)
+		if err != nil || !empty {
+			// On error, or while the folder still has contents, stop: ancestors
+			// can't be empty either.
+			return
+		}
+		if err := e.driveClient.DeleteFile(e.ctx, id); err != nil {
+			slog.Warn("prune empty remote folder failed", "dir", slashDir, "error", err)
+			return
+		}
+		e.uncacheRemoteDir(slashDir)
+		slashDir = path.Dir(slashDir)
+	}
+}
+
+// driveFolderIsEmpty reports whether the given Drive folder has no non-trashed
+// children.
+func (e *Engine) driveFolderIsEmpty(folderID string) (bool, error) {
+	files, _, err := e.driveClient.ListFiles(e.ctx, folderID, "")
+	if err != nil {
+		return false, err
+	}
+	return len(files) == 0, nil
+}
+
+// lookupRemoteDirID resolves the Drive folder ID for a plaintext relative
+// directory WITHOUT creating any folders (unlike resolveRemoteDir). It returns
+// false if the folder does not exist remotely. Discovered IDs are cached.
+func (e *Engine) lookupRemoteDirID(slashDir string) (string, bool) {
+	slashDir = path.Clean(slashDir)
+	if slashDir == "." || slashDir == "/" || slashDir == "" {
+		return e.pair.DriveFolderID, true
+	}
+
+	e.folderMu.Lock()
+	cached, ok := e.folderCache[slashDir]
+	e.folderMu.Unlock()
+	if ok {
+		return cached, true
 	}
 
 	parentID := e.pair.DriveFolderID
@@ -1504,30 +1661,46 @@ func (e *Engine) resolveRemoteDir(relDir string) (string, error) {
 		} else {
 			cum += "/" + comp
 		}
-		if id, ok := e.folderCache[cum]; ok {
+		e.folderMu.Lock()
+		id, ok := e.folderCache[cum]
+		e.folderMu.Unlock()
+		if ok {
 			parentID = id
 			continue
 		}
 		encName, err := crypto.EncryptFilename(comp, e.masterKey)
 		if err != nil {
-			return "", fmt.Errorf("encrypt dir component %q: %w", comp, err)
+			return "", false
 		}
-		id, err := e.driveClient.EnsureFolderUnder(e.ctx, parentID, encName)
-		if err != nil {
-			return "", fmt.Errorf("ensure remote folder %q: %w", cum, err)
+		childID, found := e.findChildFolderID(parentID, encName)
+		if !found {
+			return "", false
 		}
-		e.folderCache[cum] = id
-		parentID = id
+		e.cacheRemoteDir(cum, childID)
+		parentID = childID
 	}
-	return parentID, nil
+	return parentID, true
 }
 
-// cacheRemoteDir records the Drive folder ID for a plaintext relative directory
-// (slash-separated) discovered while walking the remote tree.
-func (e *Engine) cacheRemoteDir(relDir, folderID string) {
-	e.folderMu.Lock()
-	e.folderCache[relDir] = folderID
-	e.folderMu.Unlock()
+// findChildFolderID returns the ID of the immediate child folder of parentID
+// whose (encrypted) name equals encName, or false if there is no such folder.
+func (e *Engine) findChildFolderID(parentID, encName string) (string, bool) {
+	pageToken := ""
+	for {
+		files, next, err := e.driveClient.ListFiles(e.ctx, parentID, pageToken)
+		if err != nil {
+			return "", false
+		}
+		for _, f := range files {
+			if f.IsFolder() && f.Name == encName {
+				return f.ID, true
+			}
+		}
+		if next == "" {
+			return "", false
+		}
+		pageToken = next
+	}
 }
 
 // ---------------------------------------------------------------------------

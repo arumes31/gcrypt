@@ -4,7 +4,8 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"sync"
+	"net"
+	"net/http"
 	"time"
 
 	"google.golang.org/api/drive/v3"
@@ -25,12 +26,15 @@ import (
 const uploadChunkSize = 8 * 1024 * 1024 // 8 MiB
 
 // Client wraps the Google Drive API service and provides high-level operations
-// for file and folder management within the gcrypt root folder.
+// for file and folder management within the gcrypt root folder. The underlying
+// *drive.Service (an http.Client) is safe for concurrent use, and every field is
+// set once at construction and only read afterwards, so Client methods may be
+// called concurrently — that is what lets the sync engine upload files in
+// parallel.
 type Client struct {
 	svc      *drive.Service
 	config   *oauth2.Config
 	token    *oauth2.Token
-	mu       sync.Mutex
 	folderID string
 }
 
@@ -91,9 +95,35 @@ func NewClient(ctx context.Context, oauthCfg OAuthConfig, token *oauth2.Token, f
 		return nil, fmt.Errorf("drive: failed to create OAuth config: %w", err)
 	}
 
-	// config.Client may trigger a token refresh; NewService may perform API
-	// discovery — both can block on the network.
-	httpClient := config.Client(ctx, token)
+	// Build the OAuth HTTP client on top of a transport with finite timeouts so a
+	// stalled Drive request can never hang forever. That matters a lot here: Drive
+	// operations are serialised through c.mu, so one wedged request would block
+	// every worker (the sync appears to "stop" with no error). These are
+	// transport-level timeouts that abort dead connections without capping the
+	// total duration of a legitimately long, still-progressing transfer.
+	base := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ExpectContinueTimeout: 5 * time.Second,
+		ResponseHeaderTimeout: 120 * time.Second,
+	}
+
+	// IMPORTANT: the oauth2 HTTP client retains this context for the entire
+	// lifetime of the client and uses it for every background token refresh. It
+	// must therefore be long-lived — passing the caller's short-lived ctx (e.g. a
+	// 30s timeout used for the initial connectivity check) would make every token
+	// refresh fail with "context canceled" once the access token expires (~1h),
+	// silently breaking all Drive operations and stalling the sync. Use
+	// context.Background() for refreshes; per-request deadlines are applied via
+	// each API call's own Context() instead.
+	refreshCtx := context.WithValue(context.Background(), oauth2.HTTPClient, &http.Client{Transport: base})
+	httpClient := config.Client(refreshCtx, token)
+
+	// NewService may perform API discovery — bound that to the caller's ctx.
 	svc, err := drive.NewService(ctx, option.WithHTTPClient(httpClient))
 	if err != nil {
 		return nil, fmt.Errorf("drive: failed to create Drive service: %w", err)
@@ -111,9 +141,6 @@ func NewClient(ctx context.Context, oauthCfg OAuthConfig, token *oauth2.Token, f
 // client's root folder. If found, it returns the existing folder's ID. If not,
 // it creates the folder and returns the new ID.
 func (c *Client) EnsureFolder(ctx context.Context, name string) (string, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	parentID := c.folderID
 
 	// Search for an existing folder with this name in the parent.
@@ -160,9 +187,6 @@ func (c *Client) EnsureFolder(ctx context.Context, name string) (string, error) 
 // arbitrary parent and is used to build the encrypted folder chain for the
 // hierarchical layout.
 func (c *Client) EnsureFolderUnder(ctx context.Context, parentID, name string) (string, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	query := fmt.Sprintf(
 		"name='%s' and '%s' in parents and mimeType='%s' and trashed=false",
 		name, parentID, folderMimeType,
@@ -200,9 +224,6 @@ func (c *Client) EnsureFolderUnder(ctx context.Context, parentID, name string) (
 // UploadFile uploads content as a new file with the given name under the
 // specified parent folder on Google Drive.
 func (c *Client) UploadFile(ctx context.Context, name string, parentID string, content io.Reader) (*DriveFile, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	file := &drive.File{
 		Name:    name,
 		Parents: []string{parentID},
@@ -223,9 +244,6 @@ func (c *Client) UploadFile(ctx context.Context, name string, parentID string, c
 // DownloadFile downloads the content of the file with the given ID and returns
 // an io.ReadCloser. The caller is responsible for closing the reader when done.
 func (c *Client) DownloadFile(ctx context.Context, fileID string) (io.ReadCloser, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	resp, err := c.svc.Files.Get(fileID).
 		Context(ctx).
 		Download()
@@ -240,9 +258,6 @@ func (c *Client) DownloadFile(ctx context.Context, fileID string) (io.ReadCloser
 // It returns a slice of DriveFile, the next page token (empty if no more
 // pages), and any error.
 func (c *Client) ListFiles(ctx context.Context, parentID string, pageToken string) ([]*DriveFile, string, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	query := fmt.Sprintf("'%s' in parents and trashed=false", parentID)
 
 	call := c.svc.Files.List().
@@ -270,9 +285,6 @@ func (c *Client) ListFiles(ctx context.Context, parentID string, pageToken strin
 
 // GetFile retrieves metadata for a single file by its ID.
 func (c *Client) GetFile(ctx context.Context, fileID string) (*DriveFile, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	result, err := c.svc.Files.Get(fileID).
 		Fields("id,name,mimeType,size,modifiedTime,md5Checksum,parents").
 		Context(ctx).
@@ -286,9 +298,6 @@ func (c *Client) GetFile(ctx context.Context, fileID string) (*DriveFile, error)
 
 // DeleteFile permanently deletes the file with the given ID from Google Drive.
 func (c *Client) DeleteFile(ctx context.Context, fileID string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	err := c.svc.Files.Delete(fileID).
 		Context(ctx).
 		Do()
@@ -301,9 +310,6 @@ func (c *Client) DeleteFile(ctx context.Context, fileID string) error {
 
 // UpdateFile replaces the content of an existing file on Google Drive.
 func (c *Client) UpdateFile(ctx context.Context, fileID string, content io.Reader) (*DriveFile, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	result, err := c.svc.Files.Update(fileID, &drive.File{}).
 		Media(limitUploadReader(content), googleapi.ChunkSize(uploadChunkSize)).
 		Fields("id,name,mimeType,size,modifiedTime,md5Checksum,parents").
@@ -319,9 +325,6 @@ func (c *Client) UpdateFile(ctx context.Context, fileID string, content io.Reade
 // SearchByName searches for files with the given name in the specified parent
 // folder. It returns all matching files (not trashed).
 func (c *Client) SearchByName(ctx context.Context, name string, parentID string) ([]*DriveFile, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	query := fmt.Sprintf("name='%s' and '%s' in parents and trashed=false", name, parentID)
 
 	list, err := c.svc.Files.List().
