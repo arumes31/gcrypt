@@ -153,6 +153,10 @@ type Engine struct {
 	maxRetries  int
 	workers     int
 	rateLimiter *time.Ticker
+	// largeUploadSem bounds concurrent large-file uploads (each buffers up to one
+	// upload chunk) so a high worker count stays memory-safe. Buffered to
+	// maxConcurrentLargeUploads; small files don't acquire it.
+	largeUploadSem chan struct{}
 
 	// folderCache maps a slash-separated plaintext relative directory to its
 	// Drive folder ID, for the hierarchical layout. Guarded by folderMu. The
@@ -188,15 +192,43 @@ func WithMaxRetries(n int) EngineOption {
 	return func(e *Engine) { e.maxRetries = n }
 }
 
-// defaultWorkers is the number of concurrent upload/download worker goroutines
-// per engine when not overridden by app.upload_workers. Uploads run in parallel
-// (the Drive client is concurrency-safe), so this directly drives throughput for
-// large numbers of small files.
-const defaultWorkers = 8
+// defaultWorkers is the worker-pool size per engine when not overridden by
+// app.upload_workers. Small-file throughput is bound by per-request latency
+// (~1s per small upload against Drive), so throughput ≈ workers ÷ latency and
+// concurrency is the main lever: to actually approach the request-rate cap you
+// need roughly maxRequestsPerSec workers in flight. The pool is load-adaptive by
+// nature — idle workers just block on the (empty) queue costing ~nothing, so
+// only as many as there is work run concurrently (it scales from ~0 up to this
+// many), which is why a high default is safe for light workloads. Large files
+// are separately capped (see maxConcurrentLargeUploads) so a high count stays
+// memory-safe; small files only buffer their own (small) size.
+const defaultWorkers = 160
 
-// maxRequestsPerSec caps the per-engine Drive request rate so a high worker
-// count can't hammer the API past its per-user limits.
-const maxRequestsPerSec = 100
+// maxRequestsPerSec caps the per-engine Drive request rate. Google's per-user
+// limit is ~200 requests/s (12,000/min); we aim for ~90% of that so a saturated
+// worker pool uses nearly the full budget while leaving headroom for bursts and
+// for the metadata/listing calls, with 429 retry+backoff as the backstop. NOTE:
+// this cap is per engine (per sync pair). With multiple pairs the combined rate
+// can exceed Google's per-user limit, so lower app.upload_workers when running
+// many pairs (429s are retried regardless).
+const maxRequestsPerSec = 180
+
+// largeUploadThreshold is the file size at or above which an upload buffers a
+// full upload chunk in memory. Concurrent uploads of such files are gated by
+// maxConcurrentLargeUploads so a high worker count can't blow up memory; smaller
+// files buffer only their own size and run with full worker concurrency.
+const largeUploadThreshold = 8 * 1024 * 1024 // 8 MiB (matches drive uploadChunkSize)
+
+// maxConcurrentLargeUploads bounds how many large-file uploads run at once,
+// independent of the worker count, capping large-upload memory at roughly
+// maxConcurrentLargeUploads * 8 MiB and keeping a handful of big files from
+// monopolising bandwidth.
+const maxConcurrentLargeUploads = 3
+
+// largeRequeueDelay is how long a worker waits before re-queuing a large upload
+// that couldn't get a large-upload slot, so it doesn't spin while big files are
+// saturated.
+const largeRequeueDelay = 250 * time.Millisecond
 
 // WithWorkers sets the number of concurrent worker goroutines, overriding the
 // default. Note: the request-rate limiter is sized from the worker count at
@@ -269,9 +301,10 @@ func NewEngine(pair *config.SyncPair, appCfg *config.AppConfig, driveClient *dri
 		stateChangeCh: make(chan SyncState, 64),
 		syncNowCh:     make(chan struct{}, 1),
 		OnError:       make(chan error, 64),
-		maxRetries:    5,
-		workers:       workers,
-		rateLimiter:   time.NewTicker(time.Second / time.Duration(reqPerSec)),
+		maxRetries:     5,
+		workers:        workers,
+		rateLimiter:    time.NewTicker(time.Second / time.Duration(reqPerSec)),
+		largeUploadSem: make(chan struct{}, maxConcurrentLargeUploads),
 	}
 
 	// Apply functional options.
@@ -910,9 +943,38 @@ func (e *Engine) runWorker(id int) {
 				return
 			}
 
+			// Large-file gate: keep at most maxConcurrentLargeUploads big uploads
+			// in flight (they each buffer a chunk and hog bandwidth). A worker that
+			// can't get a slot re-queues the large op after a short delay and moves
+			// on to the next item — so a burst of large files never starves the
+			// many small-file uploads, which keep running at full concurrency.
+			isLarge := op.OpType == models.OpTypeUpload && op.File != nil && op.File.Size >= largeUploadThreshold
+			if isLarge {
+				select {
+				case e.largeUploadSem <- struct{}{}:
+					// Acquired a large-upload slot.
+				default:
+					go func(op *models.SyncOperation) {
+						select {
+						case <-time.After(largeRequeueDelay):
+						case <-e.ctx.Done():
+							return
+						}
+						select {
+						case e.workQueue <- op:
+						case <-e.ctx.Done():
+						}
+					}(op)
+					continue
+				}
+			}
+
 			e.markActive(id, op)
 			err := e.executeOperation(op)
 			e.markDone(id)
+			if isLarge {
+				<-e.largeUploadSem
+			}
 			if err != nil {
 				op.Attempts++
 				op.LastError = err.Error()

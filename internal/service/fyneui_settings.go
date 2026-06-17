@@ -178,7 +178,25 @@ func (f *FyneApp) buildSettingsTab() fyne.CanvasObject {
 		widget.NewFormItem("Log level", logLevel),
 	)
 
+	// Account section: signed-in user + Drive storage quota. These labels are
+	// populated asynchronously by refreshAccountInfo (via a background poll), so
+	// keep references on the FyneApp and kick off an immediate fetch.
+	f.accountLabel = widget.NewLabel("Not signed in")
+	f.quotaLabel = widget.NewLabel("")
+	f.quotaLabel.Importance = widget.LowImportance
+	f.quotaBar = widget.NewProgressBar()
+	f.quotaBar.Hide()
+	accountSection := container.NewVBox(
+		widget.NewLabelWithStyle("Account", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		f.accountLabel,
+		f.quotaBar,
+		f.quotaLabel,
+		widget.NewSeparator(),
+	)
+	go f.refreshAccountInfo()
+
 	body := container.NewVBox(
+		accountSection,
 		widget.NewLabelWithStyle("General", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		autoStart,
 		rememberPass,

@@ -283,6 +283,38 @@ func (c *Client) ListFiles(ctx context.Context, parentID string, pageToken strin
 	return files, list.NextPageToken, nil
 }
 
+// AccountInfo holds the signed-in user's identity and Drive storage quota,
+// as reported by the Drive "about" resource.
+type AccountInfo struct {
+	Email       string
+	DisplayName string
+	QuotaUsed   int64 // bytes used across Drive
+	QuotaLimit  int64 // total bytes available; 0 means unlimited / not reported
+}
+
+// About fetches the signed-in user's email and Drive storage quota. It is a
+// single lightweight metadata call, suitable for periodic refresh in the UI.
+func (c *Client) About(ctx context.Context) (*AccountInfo, error) {
+	about, err := c.svc.About.Get().
+		Fields("user(displayName,emailAddress),storageQuota(limit,usage)").
+		Context(ctx).
+		Do()
+	if err != nil {
+		return nil, wrapAPIError(err)
+	}
+
+	info := &AccountInfo{}
+	if about.User != nil {
+		info.Email = about.User.EmailAddress
+		info.DisplayName = about.User.DisplayName
+	}
+	if about.StorageQuota != nil {
+		info.QuotaUsed = about.StorageQuota.Usage
+		info.QuotaLimit = about.StorageQuota.Limit
+	}
+	return info, nil
+}
+
 // GetFile retrieves metadata for a single file by its ID.
 func (c *Client) GetFile(ctx context.Context, fileID string) (*DriveFile, error) {
 	result, err := c.svc.Files.Get(fileID).

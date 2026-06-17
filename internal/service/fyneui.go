@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	_ "embed"
 	"fmt"
 	"image/color"
@@ -19,6 +20,7 @@ import (
 	"fyne.io/fyne/v2/widget"
 
 	"github.com/arumes31/gcrypt/internal/appstate"
+	"github.com/arumes31/gcrypt/internal/drive"
 	syncpkg "github.com/arumes31/gcrypt/internal/sync"
 )
 
@@ -85,6 +87,13 @@ type FyneApp struct {
 	summary     *widget.Label // sync folder path
 	metrics     *widget.Label // cumulative counts + transfer rate
 	liveLabel   *widget.Label // current in-flight file(s) + pending
+	progress    *widget.ProgressBar // overall sync progress (done / total)
+
+	// Account / Drive-quota widgets (Settings tab; updated by a background poll).
+	accountLabel *widget.Label
+	quotaLabel   *widget.Label
+	quotaBar     *widget.ProgressBar
+	lastAcctTime time.Time // throttles the About() poll
 
 	// Live transfer-rate tracking (byte deltas between refreshes).
 	lastBytesUp   int64
@@ -140,6 +149,9 @@ func (f *FyneApp) Run() {
 	// Periodic refresh of stats / activity / per-pair state.
 	go f.refreshLoop()
 
+	// Periodic refresh of the signed-in account + Drive storage quota.
+	go f.accountLoop()
+
 	// Initial paint.
 	f.refresh()
 
@@ -191,6 +203,10 @@ func (f *FyneApp) buildContent() fyne.CanvasObject {
 	)
 	header := container.NewBorder(nil, nil, logoWrap, nil, textCol)
 
+	// --- Overall sync progress bar (hidden when idle / up to date). ---
+	f.progress = widget.NewProgressBar()
+	f.progress.Hide()
+
 	// --- State-driven CTA button (hidden unless an action is needed). ---
 	f.cta = widget.NewButton("", nil)
 	f.cta.Importance = widget.HighImportance
@@ -224,7 +240,7 @@ func (f *FyneApp) buildContent() fyne.CanvasObject {
 		f.pauseBtn,
 	)
 
-	top := container.NewVBox(header, f.cta, widget.NewSeparator())
+	top := container.NewVBox(header, f.progress, f.cta, widget.NewSeparator())
 	return container.NewBorder(top, footer, nil, nil, tabs)
 }
 
@@ -288,6 +304,77 @@ func (f *FyneApp) refreshLoop() {
 	defer ticker.Stop()
 	for range ticker.C {
 		fyne.Do(func() { f.refresh() })
+	}
+}
+
+// accountLoop periodically refreshes the signed-in account and Drive storage
+// quota. Quota changes slowly, so it polls far less often than the stats loop
+// and only when a Drive client is actually available.
+func (f *FyneApp) accountLoop() {
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+	// Fetch once shortly after start, then on each tick.
+	f.refreshAccountInfo()
+	for range ticker.C {
+		f.refreshAccountInfo()
+	}
+}
+
+// refreshAccountInfo fetches the account email and Drive quota off the Fyne
+// goroutine and pushes the result into the Settings-tab labels. It is a no-op
+// until the Drive client exists (i.e. the user has signed in).
+func (f *FyneApp) refreshAccountInfo() {
+	client := f.ctrl.DriveClient()
+	if client == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	info, err := client.About(ctx)
+	if err != nil {
+		if f.logger != nil {
+			f.logger.Warn("failed to fetch Drive account info", map[string]interface{}{"error": err.Error()})
+		}
+		return
+	}
+
+	f.lastAcctTime = time.Now()
+	fyne.Do(func() { f.applyAccountInfo(info) })
+}
+
+// applyAccountInfo updates the account/quota widgets. Must run on the Fyne
+// goroutine. The widgets only exist once the Settings tab has been built.
+func (f *FyneApp) applyAccountInfo(info *drive.AccountInfo) {
+	if info == nil {
+		return
+	}
+	if f.accountLabel != nil {
+		who := info.Email
+		if who == "" {
+			who = info.DisplayName
+		}
+		if who == "" {
+			who = "(unknown account)"
+		}
+		f.accountLabel.SetText(who)
+	}
+	if f.quotaLabel != nil {
+		if info.QuotaLimit > 0 {
+			pct := float64(info.QuotaUsed) / float64(info.QuotaLimit) * 100
+			f.quotaLabel.SetText(fmt.Sprintf("%s of %s used (%.1f%%)",
+				humanBytes(info.QuotaUsed), humanBytes(info.QuotaLimit), pct))
+		} else {
+			f.quotaLabel.SetText(fmt.Sprintf("%s used (unlimited)", humanBytes(info.QuotaUsed)))
+		}
+	}
+	if f.quotaBar != nil {
+		if info.QuotaLimit > 0 {
+			f.quotaBar.SetValue(float64(info.QuotaUsed) / float64(info.QuotaLimit))
+			f.quotaBar.Show()
+		} else {
+			f.quotaBar.Hide()
+		}
 	}
 }
 
@@ -403,6 +490,20 @@ func (f *FyneApp) refreshSummary(state appstate.State) {
 		metrics += fmt.Sprintf("\n↑ %s   ↓ %s", humanRate(f.rateUp), humanRate(f.rateDown))
 	}
 	f.metrics.SetText(metrics)
+
+	// Overall progress: completed (this session) vs. completed + outstanding.
+	// Shown only while there is in-flight or queued work; hidden when idle so it
+	// doesn't sit at a misleading 100%.
+	if f.progress != nil {
+		done := upFiles + downFiles
+		total := done + int64(active) + int64(pending)
+		if total > 0 && (active > 0 || pending > 0) {
+			f.progress.SetValue(float64(done) / float64(total))
+			f.progress.Show()
+		} else {
+			f.progress.Hide()
+		}
+	}
 
 	// Live in-flight line (current file(s) + pending backlog).
 	switch {

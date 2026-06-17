@@ -364,15 +364,22 @@ app:
   auto_start: true
   log_level: "info"
   max_file_size: 104857600
-  upload_workers: 8   # concurrent uploads per sync pair (0 = default of 8)
+  upload_workers: 160   # max concurrent small-file uploads per pair (0 = default of 160)
 ```
 
 > **Throughput tuning (`upload_workers`)**: uploads run in parallel, so syncing
-> large trees of small files (e.g. `node_modules`) is bound by how many files are
-> uploaded concurrently. The default is 8 workers per pair; raise it (e.g. 16) on
-> a fast connection for more parallelism, or lower it if you hit Google Drive rate
-> limits. The per-pair request rate is capped automatically to stay within Drive's
-> per-user quota (rate-limited requests are retried with backoff).
+> large trees of small files (e.g. `node_modules`) is bound by how many files
+> upload concurrently. Each small upload takes ~1s against Drive, so throughput ≈
+> `upload_workers` files/sec — to approach Drive's request-rate ceiling you need
+> roughly that many workers in flight, which is why the default is **160**. The
+> pool is load-adaptive — only as many workers as there is work run at once,
+> scaling up to `upload_workers` and back down when the backlog drains, so a high
+> value costs nothing when idle. **Large files (≥ 8 MiB) are separately capped at
+> 3 concurrent uploads** so they can't exhaust memory or bandwidth or starve the
+> small-file uploads. The per-pair Drive request rate is capped automatically at
+> ~180/s (≈90% of Google's ~200/s per-user limit; rate-limited requests are
+> retried with backoff). **This cap is per sync pair** — lower `upload_workers`
+> if you run many pairs or still hit rate limits on a constrained connection.
 
 ### Remote Layout
 
