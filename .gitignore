@@ -20,6 +20,7 @@ config.yaml.bak
 tokens.enc
 .env
 .env.*
+.secrets
 
 # Local Databases and State
 *.db
@@ -30,6 +31,7 @@ tokens.enc
 
 # Logs
 *.log
+*.txt
 logs/
 
 # IDEs and Editors

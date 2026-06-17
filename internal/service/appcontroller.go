@@ -498,6 +498,11 @@ func (ac *AppController) HandleOAuth() error {
 
 	// Resolve OAuth credentials.
 	if err := ac.resolveOAuthCredentials(); err != nil {
+		if ac.logger != nil {
+			ac.logger.Error("OAuth credential resolution failed", map[string]interface{}{
+				"error": err.Error(),
+			})
+		}
 		ac.setState(appstate.NeedsOAuth)
 		return fmt.Errorf("service: resolving OAuth credentials: %w", err)
 	}
@@ -505,6 +510,11 @@ func (ac *AppController) HandleOAuth() error {
 	// Create the oauth2.Config.
 	oauth2Config, err := drive.NewOAuthConfig(ac.oauthCfg)
 	if err != nil {
+		if ac.logger != nil {
+			ac.logger.Error("OAuth config creation failed", map[string]interface{}{
+				"error": err.Error(),
+			})
+		}
 		ac.setState(appstate.NeedsOAuth)
 		return fmt.Errorf("service: creating OAuth config: %w", err)
 	}
@@ -947,17 +957,81 @@ func (ac *AppController) resolveOAuthCredentials() error {
 			return fmt.Errorf("service: passphrase required to decrypt OAuth client secret")
 		}
 		clientSecret, err := drive.DecryptClientSecret(ac.cfg.OAuthClientSecretEnc(), masterKey)
-		if err != nil {
-			return fmt.Errorf("service: decrypting OAuth client secret: %w", err)
+		if err == nil {
+			ac.oauthCfg = drive.OAuthConfig{
+				ClientID:     ac.cfg.OAuthClientID(),
+				ClientSecret: clientSecret,
+			}
+			return nil
 		}
-		ac.oauthCfg = drive.OAuthConfig{
-			ClientID:     ac.cfg.OAuthClientID(),
-			ClientSecret: clientSecret,
+		// The stored secret could not be decrypted. This happens for configs
+		// written by older gcrypt versions (the encrypted format was bumped to v2
+		// and old v1 blobs are not readable). Rather than dead-ending the sign-in
+		// button, prompt the user to re-enter the secret and re-save it in the
+		// current format, keeping the existing passphrase/master key intact.
+		if ac.logger != nil {
+			ac.logger.Warn("stored OAuth client secret could not be decrypted; prompting to re-enter", map[string]interface{}{
+				"error": err.Error(),
+			})
 		}
-		return nil
+		return ac.promptAndPersistOAuthCredentials()
 	}
 
-	return fmt.Errorf("service: OAuth client ID and secret are required (run setup again, or set the GCRYPT_OAUTH_CLIENT_ID and GCRYPT_OAUTH_CLIENT_SECRET environment variables)")
+	// No usable stored credentials — prompt the user for them.
+	return ac.promptAndPersistOAuthCredentials()
+}
+
+// promptAndPersistOAuthCredentials asks the user for their Google OAuth client
+// ID and secret via native dialogs, sets them on the controller, and (re)saves
+// them to the config encrypted with the current master key. It is used when no
+// usable credentials are present — including when an older config's encrypted
+// secret can no longer be decrypted — so the user can sign in without having to
+// re-run full setup (which would create a new sync identity).
+func (ac *AppController) promptAndPersistOAuthCredentials() error {
+	ac.mu.Lock()
+	masterKey := ac.masterKey
+	ac.mu.Unlock()
+	if len(masterKey) == 0 {
+		return fmt.Errorf("service: passphrase required before entering OAuth credentials")
+	}
+
+	prefillID := ""
+	if ac.cfg != nil {
+		prefillID = ac.cfg.OAuthClientID()
+	}
+
+	clientID, ok := promptText("gcrypt — Google sign-in",
+		"Enter your Google OAuth Client ID.", prefillID, false)
+	if !ok || strings.TrimSpace(clientID) == "" {
+		return fmt.Errorf("service: Google OAuth client ID is required to sign in")
+	}
+	clientSecret, ok := promptText("gcrypt — Google sign-in",
+		"Enter your Google OAuth Client Secret.", "", true)
+	if !ok || strings.TrimSpace(clientSecret) == "" {
+		return fmt.Errorf("service: Google OAuth client secret is required to sign in")
+	}
+	clientID = strings.TrimSpace(clientID)
+	clientSecret = strings.TrimSpace(clientSecret)
+
+	ac.oauthCfg = drive.OAuthConfig{ClientID: clientID, ClientSecret: clientSecret}
+
+	// Persist the credentials (re-encrypted in the current v2 format) so the user
+	// only has to enter them once.
+	if ac.cfg != nil {
+		encSecret, err := drive.EncryptClientSecret(clientSecret, masterKey)
+		if err != nil {
+			if ac.logger != nil {
+				ac.logger.Warn("failed to encrypt refreshed OAuth client secret", map[string]interface{}{"error": err.Error()})
+			}
+		} else {
+			ac.cfg.SetOAuthClientID(clientID)
+			ac.cfg.SetOAuthClientSecretEnc(encSecret)
+			if err := config.Save(config.ConfigPath(), ac.cfg); err != nil && ac.logger != nil {
+				ac.logger.Warn("failed to persist refreshed OAuth credentials", map[string]interface{}{"error": err.Error()})
+			}
+		}
+	}
+	return nil
 }
 
 // listenAsyncErrors reads errors from the SyncManager's OnError channel and

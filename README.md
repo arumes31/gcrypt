@@ -396,6 +396,13 @@ SQLite is used for local state tracking, mapping local files to encrypted remote
 1. **Red Icon (Error / Disconnected)**: A critical synchronization error occurred or the network is offline. Check the log file (`%APPDATA%\gcrypt\gcrypt.log`) for error details.
 2. **Yellow Icon (Warning)**: Action is required to resume sync. Open the gcrypt GUI panel to run setup, unlock the app using your passphrase, or authenticate with Google.
 3. **Database Error**: Try deleting the local state database at `%APPDATA%\gcrypt\gcrypt.db` and restarting the application to rebuild the local file metadata cache.
+4. **Tray icon works but the window never opens (especially over Remote Desktop)**: The GUI renders with OpenGL, and Remote Desktop sessions, many VMs, and machines with broken GPU drivers expose no usable hardware OpenGL. The log will show `Fyne error: window creation error … WGL: The driver does not appear to support OpenGL`. Fix: install a software OpenGL renderer once by running `install-mesa.ps1`:
+
+   ```powershell
+   pwsh -ExecutionPolicy Bypass -File .\install-mesa.ps1
+   ```
+
+   This downloads Mesa3D (llvmpipe) and places its DLLs in a `mesa\` folder next to `gcrypt.exe`. gcrypt then detects inadequate OpenGL automatically (RDP / VM / bad drivers), switches to software rendering and relaunches — the window opens normally. Machines with a working GPU keep using hardware OpenGL and ignore the bundled Mesa. (To *force* software rendering everywhere, copy the `mesa\*.dll` files directly next to `gcrypt.exe`.)
 
 ---
 

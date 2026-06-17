@@ -13,6 +13,7 @@ import (
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/driver/desktop"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
@@ -323,7 +324,13 @@ func (f *FyneApp) refresh() {
 	case appstate.NeedsPassphrase:
 		f.setCTA("Unlock", func() { go func() { _ = f.ctrl.HandlePassphrase() }() })
 	case appstate.NeedsOAuth:
-		f.setCTA("Sign in with Google", func() { go func() { _ = f.ctrl.HandleOAuth() }() })
+		f.setCTA("Sign in with Google", func() {
+			go func() {
+				if err := f.ctrl.HandleOAuth(); err != nil {
+					fyne.Do(func() { dialog.ShowError(err, f.win) })
+				}
+			}()
+		})
 	default:
 		f.cta.Hide()
 	}

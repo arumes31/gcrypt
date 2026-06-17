@@ -36,15 +36,6 @@ func main() {
 	// from a terminal or when built with -H=windowsgui).
 	hideConsoleIfOwned()
 
-	// Under Remote Desktop there is no hardware OpenGL, which would otherwise
-	// stop Fyne from ever creating its window. Switch on the bundled software
-	// OpenGL renderer before any GUI initialisation so the flyout window works
-	// over RDP (requires the Mesa opengl32.dll shipped next to the binary).
-	remoteSession := isRemoteSession()
-	if remoteSession {
-		enableSoftwareOpenGL()
-	}
-
 	flag.Parse()
 
 	// --- Tray-first startup sequence --------------------------------------
@@ -116,11 +107,13 @@ func main() {
 		"version": Version,
 	})
 
-	if remoteSession {
-		logger.Info("Remote Desktop session detected; enabled software OpenGL (Mesa llvmpipe) for the GUI", map[string]interface{}{
-			"gallium_driver": os.Getenv("GALLIUM_DRIVER"),
-			"hint":           "the flyout window needs a Mesa opengl32.dll next to gcrypt.exe over RDP",
-		})
+	// Ensure the GUI has a usable OpenGL implementation before Fyne initialises.
+	// On Remote Desktop / VMs / broken GPU drivers there is no hardware OpenGL, so
+	// this switches to a bundled software renderer (Mesa llvmpipe) and re-launches
+	// when needed. If it re-launches, the child process takes over and we exit.
+	if ensureWorkingOpenGL(logger.Info) {
+		logger.Info("handing over to software-OpenGL relaunch")
+		return
 	}
 
 	// 3. Create AppController (determines initial state from config).
