@@ -34,9 +34,6 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.App.AutoStart != true {
 		t.Error("default AutoStart should be true")
 	}
-	if cfg.App.StartMinimized != false {
-		t.Error("default StartMinimized should be false")
-	}
 	if cfg.App.LogMaxSize != 10 {
 		t.Errorf("default LogMaxSize = %d, want 10", cfg.App.LogMaxSize)
 	}
@@ -79,7 +76,6 @@ func TestV2RoundTrip(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Encryption.PassphraseHash = "argon2id$test$hash"
 	cfg.App.LogLevel = "debug"
-	cfg.App.StartMinimized = true
 	cfg.App.MaxFileSize = 1024 * 1024 * 50 // 50 MiB
 
 	pair := cfg.AddSyncPair("/tmp/gcrypt", "folder123", []string{"*.tmp", "~$*"}, 60)
@@ -132,9 +128,6 @@ func TestV2RoundTrip(t *testing.T) {
 	}
 	if loaded.App.LogLevel != "debug" {
 		t.Errorf("LogLevel mismatch: got %q, want %q", loaded.App.LogLevel, "debug")
-	}
-	if loaded.App.StartMinimized != true {
-		t.Error("StartMinimized should be true")
 	}
 	if loaded.App.MaxFileSize != 1024*1024*50 {
 		t.Errorf("MaxFileSize mismatch: got %d, want %d", loaded.App.MaxFileSize, 1024*1024*50)

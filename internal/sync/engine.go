@@ -82,6 +82,30 @@ type SyncActivity struct {
 	Current []string // short descriptions of the in-flight operations (e.g. "↑ report.pdf")
 }
 
+// ActivityKind classifies a completed sync event for the activity feed.
+type ActivityKind string
+
+const (
+	ActivityUpload   ActivityKind = "upload"
+	ActivityDownload ActivityKind = "download"
+	ActivityDelete   ActivityKind = "delete"
+	ActivityConflict ActivityKind = "conflict"
+)
+
+// ActivityEvent is a single completed sync operation, recorded for the
+// Nextcloud-style activity feed in the GUI. Events are kept in a bounded,
+// most-recent-first ring buffer per engine.
+type ActivityEvent struct {
+	Time   time.Time
+	Kind   ActivityKind
+	Name   string // base file name, e.g. "report.pdf"
+	Path   string // local path relative to the sync root
+	PairID string
+}
+
+// maxRecentEvents bounds the per-engine activity history.
+const maxRecentEvents = 100
+
 // ---------------------------------------------------------------------------
 // Engine
 // ---------------------------------------------------------------------------
@@ -105,6 +129,10 @@ type Engine struct {
 	// activeOps tracks the operation each worker is currently executing,
 	// keyed by worker id. Guarded by mu. Used for the live activity display.
 	activeOps map[int]string
+
+	// recentEvents is a bounded, most-recent-last ring of completed operations
+	// for the GUI activity feed. Guarded by mu.
+	recentEvents []ActivityEvent
 
 	// pendingOps counts operations that have been enqueued but not yet
 	// terminally completed (queued + in-flight + awaiting retry). It is the
@@ -575,6 +603,76 @@ func (e *Engine) markDone(id int) {
 	e.mu.Unlock()
 }
 
+// recordEvent appends a completed operation to the activity feed ring buffer,
+// dropping the oldest entry once the cap is reached.
+func (e *Engine) recordEvent(op *models.SyncOperation) {
+	if op == nil {
+		return
+	}
+	kind := activityKindForOp(op.OpType)
+	if kind == "" {
+		return // not a feed-worthy op type
+	}
+	var name, path string
+	if op.File != nil {
+		path = op.File.LocalPath
+		name = filepath.Base(path)
+	}
+	ev := ActivityEvent{
+		Time:   time.Now(),
+		Kind:   kind,
+		Name:   name,
+		Path:   path,
+		PairID: e.pair.ID,
+	}
+
+	e.mu.Lock()
+	e.recentEvents = append(e.recentEvents, ev)
+	if len(e.recentEvents) > maxRecentEvents {
+		// Drop the oldest events, keeping the most recent maxRecentEvents.
+		e.recentEvents = e.recentEvents[len(e.recentEvents)-maxRecentEvents:]
+	}
+	e.mu.Unlock()
+}
+
+// RecentEvents returns up to limit most-recent-first activity events. A limit
+// <= 0 returns all retained events.
+func (e *Engine) RecentEvents(limit int) []ActivityEvent {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	n := len(e.recentEvents)
+	if n == 0 {
+		return nil
+	}
+	if limit <= 0 || limit > n {
+		limit = n
+	}
+	out := make([]ActivityEvent, 0, limit)
+	// recentEvents is oldest-first; emit most-recent-first.
+	for i := n - 1; i >= 0 && len(out) < limit; i-- {
+		out = append(out, e.recentEvents[i])
+	}
+	return out
+}
+
+// activityKindForOp maps an operation type to an activity feed kind, or "" if
+// the operation should not appear in the feed.
+func activityKindForOp(t models.OpType) ActivityKind {
+	switch t {
+	case models.OpTypeUpload:
+		return ActivityUpload
+	case models.OpTypeDownload:
+		return ActivityDownload
+	case models.OpTypeDeleteRemote, models.OpTypeDeleteLocal:
+		return ActivityDelete
+	case models.OpTypeConflict:
+		return ActivityConflict
+	default:
+		return ""
+	}
+}
+
 // opDescription renders a short, human-readable label for an operation, e.g.
 // "↑ report.pdf" for an upload.
 func opDescription(op *models.SyncOperation) string {
@@ -659,6 +757,14 @@ func (e *Engine) processEvents() {
 				// Try to preserve existing remote ID from the store.
 				existing, err := e.store.GetSyncFile(e.pair.ID, ev.Path)
 				if err == nil && existing != nil {
+					// If the file is already recorded as synced with this exact
+					// content, the event carries no real change — most commonly
+					// it was triggered by our own write while downloading the
+					// file. Skip the redundant upload to avoid re-encrypting and
+					// re-pushing every downloaded file.
+					if existing.SyncStatus == models.SyncStatusSynced && existing.LocalHash == sf.LocalHash {
+						continue
+					}
 					sf.RemoteID = existing.RemoteID
 				}
 				e.enqueueWork(newSyncOperation(sf, models.OpTypeUpload, e.maxRetries))
@@ -805,9 +911,10 @@ func (e *Engine) runWorker(id int) {
 					atomic.AddInt64(&e.pendingOps, -1)
 				}
 			} else {
-				// Operation succeeded — terminal. Clear it from the backlog and
-				// update the last sync time.
+				// Operation succeeded — terminal. Clear it from the backlog,
+				// record it for the activity feed, and update the last sync time.
 				atomic.AddInt64(&e.pendingOps, -1)
+				e.recordEvent(op)
 				e.mu.Lock()
 				e.stats.LastSyncTime = time.Now()
 				e.mu.Unlock()
@@ -1111,17 +1218,32 @@ func (e *Engine) deleteLocal(sf *models.SyncFile) error {
 // Conflict Resolution
 // ---------------------------------------------------------------------------
 
-// resolveConflict implements last-write-wins conflict resolution.
+// resolveConflict reconciles a file that changed remotely. If the local copy is
+// untouched since the last sync it simply pulls the remote update; if the local
+// copy also changed it applies last-write-wins, preserving the local copy as a
+// backup when the remote version wins.
 func (e *Engine) resolveConflict(sf *models.SyncFile) error {
-	// 1. Compare local and remote modification times.
-	localModTime := sf.ModTime
-	// Use the current file's mod time from disk if available.
 	localPath := filepath.Join(e.pair.LocalDir, sf.LocalPath)
+
+	// If the local copy is gone, re-create it from the remote. A genuine local
+	// deletion is reconciled separately via delete operations; pulling the
+	// remote here is the safe default and never loses data.
+	if _, statErr := os.Stat(localPath); os.IsNotExist(statErr) {
+		return e.downloadFile(sf)
+	}
+
+	// If the local copy is unchanged since our last sync (sf.LocalHash is the
+	// content hash recorded then), there is no real conflict — just pull the
+	// remote update without creating a backup.
+	if curHash, err := e.scanner.ComputeHash(localPath); err == nil && curHash == sf.LocalHash {
+		return e.downloadFile(sf)
+	}
+
+	// Both sides diverged — apply last-write-wins by modification time.
+	localModTime := sf.ModTime
 	if info, err := os.Stat(localPath); err == nil {
 		localModTime = info.ModTime()
 	}
-
-	// Get remote modification time.
 	var remoteModTime time.Time
 	if sf.RemoteID != "" {
 		if remoteFile, err := e.driveClient.GetFile(e.ctx, sf.RemoteID); err == nil {
@@ -1129,27 +1251,25 @@ func (e *Engine) resolveConflict(sf *models.SyncFile) error {
 		}
 	}
 
-	// 2. If local is newer: upload local version (overwrite remote).
+	// Local strictly newer → push the local version over the remote.
 	if localModTime.After(remoteModTime) {
 		return e.uploadFile(sf)
 	}
 
-	// 3. If remote is newer: save a conflict backup, then download.
-	if remoteModTime.After(localModTime) {
-		// Save current local file as a conflict backup.
-		backupPath := fmt.Sprintf("%s.conflict.%s", localPath, time.Now().Format("20060102-150405"))
-		if data, err := os.ReadFile(localPath); err == nil {
-			_ = os.WriteFile(backupPath, data, 0600)
+	// Remote newer (or identical timestamp) → remote wins: preserve the local
+	// copy as a timestamped backup, then download the remote version.
+	// downloadFile records the new remote hash, so the conflict does not
+	// re-trigger on every subsequent poll. The backup is best-effort and is
+	// streamed so large files are not loaded fully into memory.
+	backupPath := fmt.Sprintf("%s.conflict.%s", localPath, time.Now().Format("20060102-150405"))
+	if src, err := os.Open(localPath); err == nil {
+		if dst, err := os.OpenFile(backupPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600); err == nil {
+			_, _ = io.Copy(dst, src)
+			_ = dst.Close()
 		}
-		// Download the remote version.
-		return e.downloadFile(sf)
+		_ = src.Close()
 	}
-
-	// Same timestamp — treat as synced.
-	if err := e.store.UpdateStatus(e.pair.ID, sf.LocalPath, models.SyncStatusSynced); err != nil {
-		return fmt.Errorf("sync: update status after conflict %s: %w", sf.LocalPath, err)
-	}
-	return nil
+	return e.downloadFile(sf)
 }
 
 // ---------------------------------------------------------------------------
@@ -1162,10 +1282,13 @@ func (e *Engine) resolveConflict(sf *models.SyncFile) error {
 func (e *Engine) pollRemoteChanges() {
 	defer e.wg.Done()
 
-	// Determine the sync interval from the pair (default 5 minutes).
+	// Determine the sync interval from the pair, flooring it at 5 seconds so a
+	// misconfigured tiny value can't hammer the Drive API. (Previously a value
+	// below 5s was bumped all the way up to 5 minutes, which surprisingly made a
+	// "fast" interval the slowest.)
 	interval := time.Duration(e.pair.EffectiveSyncInterval()) * time.Second
 	if interval < 5*time.Second {
-		interval = 5 * time.Minute
+		interval = 5 * time.Second
 	}
 
 	ticker := time.NewTicker(interval)
@@ -1224,10 +1347,10 @@ func (e *Engine) pollOnce() error {
 		return fmt.Errorf("list store files: %w", err)
 	}
 
-	remoteIDSet := make(map[string]struct{}, len(trackedFiles))
+	remoteByID := make(map[string]*models.SyncFile, len(trackedFiles))
 	for _, sf := range trackedFiles {
 		if sf.RemoteID != "" {
-			remoteIDSet[sf.RemoteID] = struct{}{}
+			remoteByID[sf.RemoteID] = sf
 		}
 	}
 
@@ -1236,9 +1359,10 @@ func (e *Engine) pollOnce() error {
 		return nil
 	}
 
-	// For each remote file not in the store → create a download operation.
 	for _, rf := range remoteFiles {
-		if _, tracked := remoteIDSet[rf.ID]; !tracked {
+		tracked, isTracked := remoteByID[rf.ID]
+		if !isTracked {
+			// New remote file → download.
 			sf := &models.SyncFile{
 				LocalPath:  rf.LocalPath,
 				RemoteID:   rf.ID,
@@ -1247,6 +1371,25 @@ func (e *Engine) pollOnce() error {
 				ModTime:    rf.ModTime,
 			}
 			e.enqueueWork(newSyncOperation(sf, models.OpTypeDownload, e.maxRetries))
+			continue
+		}
+
+		// Already tracked: detect a remote modification (e.g. another machine
+		// edited the file) by comparing the Drive content hash against what we
+		// recorded at the last sync. Without this, edits to existing files never
+		// propagate — only new files and deletions would. A change is reconciled
+		// via conflict resolution, which pulls the remote update when the local
+		// copy is untouched and otherwise backs up the local copy first.
+		if rf.RemoteHash != "" && tracked.RemoteHash != "" && rf.RemoteHash != tracked.RemoteHash {
+			sf := &models.SyncFile{
+				LocalPath:  tracked.LocalPath,
+				RemoteID:   rf.ID,
+				RemoteHash: rf.RemoteHash,
+				LocalHash:  tracked.LocalHash,
+				Size:       rf.Size,
+				ModTime:    rf.ModTime,
+			}
+			e.enqueueWork(newSyncOperation(sf, models.OpTypeConflict, e.maxRetries))
 		}
 	}
 

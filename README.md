@@ -1,4 +1,8 @@
-# gcrypt
+<p align="center">
+  <img src="branding/logo.png" alt="gcrypt logo" width="140">
+</p>
+
+<h1 align="center">gcrypt</h1>
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 ![Windows](https://img.shields.io/badge/Platform-Windows%2010%2B-green.svg)
@@ -6,28 +10,12 @@
 
 **gcrypt** is a Windows desktop Google Drive sync client with client-side encryption. All files are encrypted locally before being uploaded to Google Drive, ensuring that no plaintext data ever leaves your machine.
 
-## New in gcrypt v2
-
-### ✨ Multi-Sync Support
-Sync multiple directory pairs simultaneously. Configure and manage independent sync relationships from the system tray menu.
-
-### 🛠️ Tray Menu Settings UI
-Full settings configuration directly from the system tray—no config file editing required. Adjust global settings and per-pair options on the fly.
-
-### 🔐 Enhanced Security
-- Industry-standard **Argon2id** for key derivation (64 MiB memory, 3 iterations)
-- Per-file unique keys with **AES-256-GCM** encryption
-- File path binding via SHA-256 AAD to prevent relocation attacks
-- Memory-protected master key using Windows VirtualLock
-
-### 📊 Real-Time Status Monitoring
-Visual status indicators for each sync pair (Idle, Syncing, Scanning, Error, Paused). Monitor global and per-directory sync statistics.
-
 ## Table of Contents
 
 - [Features](#features)
 - [Security Model](#security-model)
 - [Installation](#installation)
+- [Google Drive API Setup](#google-drive-api-setup)
 - [Usage](#usage)
 - [Accessing Your Sync on Another PC](#accessing-your-sync-on-another-pc)
 - [Configuration](#configuration)
@@ -130,20 +118,104 @@ Encrypt with AES-256-GCM (AAD = SHA-256(filePath))
 - Windows 10 or later (64-bit)
 - Google account with Drive access
 - Go 1.26.4 or later (for building from source)
+- GCC compiler (e.g., MinGW-w64) with `cgo` support enabled (required by the Fyne GUI package)
 
 ### Building from Source
 
-```bash
+Because `gcrypt` uses the Fyne GUI toolkit, building requires CGO. Additionally, on Go 1.26+, a clang-only compilation flag causes default GCC builds to fail. To automate building the custom compiler wrapper and compiling `gcrypt` as a background GUI process, use the provided PowerShell build script:
+
+```powershell
 # Clone the repository
 git clone https://github.com/yourusername/gcrypt.git
 cd gcrypt
 
-# Build the application
-go build -o gcrypt.exe ./cmd/gcrypt/
+# Run the build script (compiles the gcc wrapper and gcrypt.exe)
+powershell -File .\build.ps1
 
 # Run setup (first time only)
 ./gcrypt.exe -setup
 ```
+
+---
+
+## Google Drive API Setup
+
+To use `gcrypt`, you need to set up a Google Cloud project with the Google Drive API enabled and configure OAuth client credentials. Follow these detailed steps:
+
+### 1. Create a Google Cloud Project
+1. Open the [Google Cloud Console](https://console.cloud.google.com/).
+2. Click the project dropdown in the top-left corner and select **New Project**.
+3. Enter a project name (e.g., `gcrypt-sync`) and click **Create**.
+
+### 2. Enable the Google Drive API
+1. Navigate to **APIs & Services** > **Library** using the left sidebar.
+2. Search for **Google Drive API**.
+3. Click on the Google Drive API result and click **Enable**.
+
+### 3. Configure the OAuth Consent Screen
+1. Go to **APIs & Services** > **OAuth consent screen** in the left sidebar.
+2. Select **External** as the User Type (this allows you to use your personal Google account) and click **Create**.
+3. Provide the required App Information:
+   - **App name**: `gcrypt`
+   - **User support email**: Select your email address.
+   - **Developer contact information**: Enter your email address.
+   - Click **Save and Continue**.
+4. Configure **Scopes**:
+   - Click **Add or Remove Scopes**.
+   - Under *Manually add scopes*, enter: `https://www.googleapis.com/auth/drive.file`
+   - Click **Add to Table** and click **Update**.
+   - Click **Save and Continue**.
+     > 🔒 **Privacy Note:** `gcrypt` uses the narrow `drive.file` scope. This means it can only access files and folders that it creates or that the user explicitly opens with it. It cannot read, modify, or delete any other files in your Google Drive.
+5. Configure **Test Users**:
+   - Google restricts unverified apps in "Testing" status to specific authorized users.
+   - Click **Add Users** and enter the email address of the Google Account you wish to sync files with.
+   - Click **Save and Continue**, review the summary, and return to the dashboard.
+
+### 4. Create OAuth Client Credentials
+1. Navigate to **APIs & Services** > **Credentials** in the left sidebar.
+2. Click **+ Create Credentials** at the top of the page and select **OAuth client ID**.
+3. Select **Application type**: **Web application**.
+   > ℹ️ **Why Web application?**
+   > `gcrypt` listens on a local loopback port (`http://localhost:8089/callback`) to receive the OAuth authorization code after you sign in via your web browser. A Web Application client ID is required to register this redirect URI.
+4. Enter a name (e.g., `gcrypt-client`).
+5. Under **Authorized redirect URIs**, click **+ Add URI** and enter exactly:
+   ```
+   http://localhost:8089/callback
+   ```
+6. Click **Create**.
+7. Copy the generated **Client ID** and **Client Secret**. Keep these secure.
+
+### 5. Configure gcrypt with Credentials
+You can provide these credentials to `gcrypt` in one of two ways:
+
+#### Method A: The Setup Wizard (Recommended)
+When you run `./gcrypt.exe -setup` (or when prompted by the system tray GUI on first launch), you will be asked to enter the **Client ID** and **Client Secret**. `gcrypt` will encrypt the secret using your passphrase-derived master key and persist both in your config file (`%APPDATA%\gcrypt\config.yaml`):
+```yaml
+oauth:
+  client_id: "YOUR_CLIENT_ID"
+  client_secret_enc: "ENCRYPTED_SECRET_BASE64"
+```
+
+#### Method B: Environment Variables
+If you prefer not to store credentials in your configuration file, you can set them as environment variables before starting `gcrypt`. This is especially useful for Docker container deployment or scripts:
+- **PowerShell / Windows Terminal**:
+  ```powershell
+  $env:GCRYPT_OAUTH_CLIENT_ID="your-client-id"
+  $env:GCRYPT_OAUTH_CLIENT_SECRET="your-client-secret"
+  ./gcrypt.exe
+  ```
+- **Windows Command Prompt (CMD)**:
+  ```cmd
+  set GCRYPT_OAUTH_CLIENT_ID=your-client-id
+  set GCRYPT_OAUTH_CLIENT_SECRET=your-client-secret
+  gcrypt.exe
+  ```
+- **Linux / Docker** (if applicable):
+  ```bash
+  export GCRYPT_OAUTH_CLIENT_ID="your-client-id"
+  export GCRYPT_OAUTH_CLIENT_SECRET="your-client-secret"
+  ```
+When these environment variables are set, they take precedence over config settings and bypass the credential prompt.
 
 ---
 
@@ -166,53 +238,51 @@ go build -o gcrypt.exe ./cmd/gcrypt/
 #### Auto-Start
 gcrypt automatically adds itself to Windows startup. Enable/disable in:
 - Settings → Apps → Startup → gcrypt
-- Or via tray menu: Settings → Auto-start with Windows
+- Or via the main window's **Settings** tab: **Auto-start with Windows**
 
-### System Tray Interface
+### System Tray & Status Indicators
 
-gcrypt runs in the background with a system tray icon:
+`gcrypt` runs in the background. Its status is represented by the system tray icon, and inside the main GUI window by a colored status dot and label:
 
-| Icon | Status |
-|------|--------|
-| 🟢 Green | Idle (all systems normal) |
-| 🔵 Blue | Syncing in progress |
-| 🟡 Yellow | Scanning files |
-| 🔴 Red | Error (check log) |
-| ⚪ Gray | Paused |
+| App State | Tray Icon File | System Tray Icon | GUI Status Dot Color | GUI Status Label | Meaning / Action Required |
+|-----------|----------------|------------------|----------------------|------------------|---------------------------|
+| **Not Configured** | `warning.png` | 🟡 Warning | 🔘 Gray | "Not configured" | The app has not been set up yet. Run the setup wizard. |
+| **Locked** | `warning.png` | 🟡 Warning | 🟡 Amber | "Locked" | Master key is not decrypted. Enter your passphrase to unlock. |
+| **Sign In Required** | `warning.png` | 🟡 Warning | 🔴 Red | "Sign in required" | OAuth token is missing or expired. Click to sign in. |
+| **Connecting** | `syncing.png` | 🔵 Syncing | 🔵 Blue | "Connecting…" | Establishing connection to Google Drive API. |
+| **Scanning** | `syncing.png` | 🔵 Syncing | 🔵 Blue | "Scanning…" | Scanning local/remote directories for changes. |
+| **Syncing** | `syncing.png` | 🔵 Syncing | 🔵 Blue | "Syncing…" | Uploading or downloading files. |
+| **Idle** | `synced.png` | 🟢 Synced | 🟢 Green | "Up to date" | Synchronized and idle. |
+| **Error** | `error.png` | 🔴 Error | 🔴 Red | "Error" | Critical error occurred. Check the log file for details. |
+| **Disconnected** | `error.png` | 🔴 Error | 🔴 Red | "Disconnected" | Network offline or connection timed out. |
 
 #### Tray Menu Structure
+
+Right-clicking the tray icon opens a quick-access menu:
+
 ```
-📊 Status: Idle              Selected folder: Syncing
-📁 Files synced: 1,234       Last sync: 5 minutes ago
-
-Sync Pairs ─────────────────
-  🟢 Documents          🟢 Downloads
-  ▶ Pause               ▶ Pause
-  🔄 Sync Now           🔄 Sync Now
-  📂 Open Folder        📂 Open Folder
-  ─────────             ─────────
-  ⚠️ Remove*            ⚠️ Remove*
-
-─────────────────────────────
-⏸️ Pause All
-🔄 Sync All Now
-
-Settings ───────────────────
-  ☑ Auto-start with Windows
-  ☐ Start minimized
-  ─────────
-  Sync Interval: [10s ▼]
-  Max File Size: [100 MB ▼]
-  Log Level: [Info ▼]
-  Log Max Size: [10 MB ▼]
-  Log Backups: [3 ▼]
-
-─────────────────────────────
-📂 Open Primary Folder
-📋 View Log
-─────────────────────────────
-❌ Quit
+Open gcrypt             <-- Opens the main GUI flyout window
+───────────────────────
+Sync All Now            <-- Force scan and sync of all folder pairs
+Pause All / Resume All  <-- Toggle sync state globally
+Open Sync Folder        <-- Open local sync directory in Explorer
+View Log                <-- Open log file in Notepad
+───────────────────────
+Quit                    <-- Gracefully stop sync engines and exit
 ```
+
+#### Main GUI Flyout Window
+
+Left-clicking the tray icon (or selecting **Open gcrypt**) opens a flyout window similar to Nextcloud, containing the following tabs:
+1. **Activity** — Shows a real-time list of synced files, errors, and progress.
+2. **Folders** — Shows status of individual sync pairs, allowing per-pair Pause/Resume, Sync Now, Open Folder, and Remove options.
+3. **Settings** — Allows managing global parameters such as:
+   - Auto-start with Windows
+   - Remember passphrase (auto-unlock via Windows DPAPI)
+   - Sync Interval
+   - Max File Size limit
+   - Log settings (Level, Max Size, Max Backups)
+   - Bandwidth Rate Limits (Upload/Download in KB/s)
 
 ---
 
@@ -223,6 +293,12 @@ Your encrypted files in Google Drive can **only** be decrypted with the master k
 ```
 Master Key = Argon2id(passphrase, salt)
 ```
+
+> [!WARNING]
+> **CRITICAL: BACK UP YOUR SALT AND PASSPHRASE!**
+> Because `gcrypt` derives the master key locally from both your passphrase and `salt.bin` (which is never uploaded to Google Drive for security reasons), you **MUST** back up both your **passphrase** and the **`salt.bin`** file.
+> 
+> If you lose both your passphrase and your `salt.bin` file, **YOUR ENCRYPTED DATA CAN NEVER BE RECOVERED**. There is no password reset, recovery key, or back door. Keep a copy of `salt.bin` in a safe, offline location (like a USB drive or password manager).
 
 The salt is generated once, on the PC where you first set up the sync, and is stored locally at `%APPDATA%\gcrypt\salt.bin`. **It is never uploaded to Google Drive.** This means a second computer cannot simply install gcrypt and run a normal setup — doing so would generate a *different* salt, derive a *different* master key, and fail to decrypt anything in the cloud.
 
@@ -317,9 +393,16 @@ SQLite is used for local state tracking, mapping local files to encrypted remote
 ## Troubleshooting
 
 ### Common Issues
-1. **Red Icon**: Authentication expired or network issue. Re-authenticate via Tray.
-2. **Yellow Icon Stays**: Check logs for disk permission errors.
-3. **Database Error**: Try deleting `.gcrypt-state/*.db` and re-syncing.
+1. **Red Icon (Error / Disconnected)**: A critical synchronization error occurred or the network is offline. Check the log file (`%APPDATA%\gcrypt\gcrypt.log`) for error details.
+2. **Yellow Icon (Warning)**: Action is required to resume sync. Open the gcrypt GUI panel to run setup, unlock the app using your passphrase, or authenticate with Google.
+3. **Database Error**: Try deleting the local state database at `%APPDATA%\gcrypt\gcrypt.db` and restarting the application to rebuild the local file metadata cache.
+4. **Tray icon works but the window never opens (especially over Remote Desktop)**: The GUI renders with OpenGL, and Remote Desktop sessions, many VMs, and machines with broken GPU drivers expose no usable hardware OpenGL. The log will show `Fyne error: window creation error … WGL: The driver does not appear to support OpenGL`. Fix: install a software OpenGL renderer once by running `install-mesa.ps1`:
+
+   ```powershell
+   pwsh -ExecutionPolicy Bypass -File .\install-mesa.ps1
+   ```
+
+   This downloads Mesa3D (llvmpipe) and places its DLLs in a `mesa\` folder next to `gcrypt.exe`. gcrypt then detects inadequate OpenGL automatically (RDP / VM / bad drivers), switches to software rendering and relaunches — the window opens normally. Machines with a working GPU keep using hardware OpenGL and ignore the bundled Mesa. (To *force* software rendering everywhere, copy the `mesa\*.dll` files directly next to `gcrypt.exe`.)
 
 ---
 
@@ -358,7 +441,7 @@ For security-related issues, please refer to our [Security Policy](SECURITY.md).
 ---
 
 ## License
-MIT License - Copyright (c) 2024 gcrypt contributors
+MIT License - Copyright (c) 2026 gcrypt contributors
 
 ---
 
@@ -367,4 +450,4 @@ For issues and feature requests, please [open an issue](https://github.com/youru
 Join our [Discord server](https://discord.gg/gcrypt) for real-time help.
 
 ---
-*gcrypt v2.0.0 - The encrypted Google Drive sync client for Windows*
+*gcrypt v0.1 - The encrypted Google Drive sync client for Windows*

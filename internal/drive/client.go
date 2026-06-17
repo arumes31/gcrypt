@@ -86,27 +86,18 @@ func wrapAPIError(err error) error {
 // configuration, token, and root folder ID. It validates the credentials,
 // builds an HTTP client from the token, and initializes the Drive service.
 func NewClient(ctx context.Context, oauthCfg OAuthConfig, token *oauth2.Token, folderID string) (*Client, error) {
-	// Log entry point for diagnostics
-	fmt.Println("[DEBUG] NewClient: starting client creation")
-
 	config, err := NewOAuthConfig(oauthCfg)
 	if err != nil {
 		return nil, fmt.Errorf("drive: failed to create OAuth config: %w", err)
 	}
-	fmt.Println("[DEBUG] NewClient: OAuth config created successfully")
 
-	// This call may trigger token refresh if the token is expired
-	fmt.Println("[DEBUG] NewClient: creating HTTP client (may trigger token refresh)")
+	// config.Client may trigger a token refresh; NewService may perform API
+	// discovery — both can block on the network.
 	httpClient := config.Client(ctx, token)
-	fmt.Println("[DEBUG] NewClient: HTTP client created successfully")
-
-	// This call may perform API discovery
-	fmt.Println("[DEBUG] NewClient: creating Drive service (may perform API discovery)")
 	svc, err := drive.NewService(ctx, option.WithHTTPClient(httpClient))
 	if err != nil {
 		return nil, fmt.Errorf("drive: failed to create Drive service: %w", err)
 	}
-	fmt.Println("[DEBUG] NewClient: Drive service created successfully")
 
 	return &Client{
 		svc:      svc,

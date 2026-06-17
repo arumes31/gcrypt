@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -32,6 +33,25 @@ const (
 	defaultMaxBackups = 3
 )
 
+// levelSeverity maps a log level name to its numeric severity. Messages below
+// the logger's configured threshold are dropped. Unknown levels are treated as
+// the most verbose so they are never accidentally suppressed.
+var levelSeverity = map[string]int{
+	"DEBUG": 0,
+	"INFO":  1,
+	"WARN":  2,
+	"ERROR": 3,
+}
+
+// severityOf returns the numeric severity for a level name (case-insensitive),
+// defaulting to DEBUG (0) for unknown names.
+func severityOf(level string) int {
+	if s, ok := levelSeverity[strings.ToUpper(level)]; ok {
+		return s
+	}
+	return 0
+}
+
 // Logger provides file-based logging with automatic rotation. Every log line
 // is also mirrored to os.Stdout for console visibility.
 type Logger struct {
@@ -40,6 +60,7 @@ type Logger struct {
 	path       string
 	maxSize    int64
 	maxBackups int
+	minLevel   int // messages below this severity are dropped
 }
 
 // NewLogger creates or opens the log file at the given path. Parent
@@ -60,6 +81,7 @@ func NewLogger(path string) (*Logger, error) {
 		path:       path,
 		maxSize:    defaultMaxSize,
 		maxBackups: defaultMaxBackups,
+		minLevel:   severityOf("INFO"),
 	}, nil
 }
 
@@ -110,6 +132,11 @@ func (l *Logger) Error(msg string, fields ...map[string]interface{}) {
 func (l *Logger) log(level string, msg string, fields ...map[string]interface{}) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+
+	// Drop messages below the configured minimum level.
+	if severityOf(level) < l.minLevel {
+		return
+	}
 
 	// Rotate if the file has grown beyond the size limit.
 	if l.file != nil {
@@ -164,17 +191,18 @@ func (l *Logger) log(level string, msg string, fields ...map[string]interface{})
 		}
 	}
 
-	// Mirror to stdout.
-	fmt.Print(line)
+	// Mirror to stderr (diagnostic output belongs on stderr, not stdout). The
+	// "%s" format keeps any '%' in the message from being interpreted.
+	fmt.Fprintf(os.Stderr, "%s", line)
 }
 
 // ---------------------------------------------------------------------------
 // Rotation
 // ---------------------------------------------------------------------------
 
-// rotate closes the current log file, shifts existing backup files by one
-// (path.1 → path.2, path → path.1), removes the oldest backup if it exceeds
-// maxBackups, and opens a fresh log file.
+// rotate closes the current log file, drops the oldest backup, shifts the
+// remaining backups up by one (path.(N-1) → path.N, …, path.1 → path.2,
+// path → path.1), and opens a fresh log file.
 //
 // Must be called with l.mu held.
 func (l *Logger) rotate() error {
@@ -186,24 +214,22 @@ func (l *Logger) rotate() error {
 		l.file = nil
 	}
 
-	// Shift backup files: path.N → path.(N+1), starting from the highest.
-	for i := l.maxBackups; i >= 1; i-- {
-		older := fmt.Sprintf("%s.%d", l.path, i)
-		newer := l.path
-		if i > 1 {
-			newer = fmt.Sprintf("%s.%d", l.path, i-1)
+	if l.maxBackups < 1 {
+		// No backups kept — discard the current log entirely.
+		_ = os.Remove(l.path)
+	} else {
+		// Drop the oldest backup, then shift every remaining backup up by one
+		// (highest first so nothing is overwritten before it has moved), and
+		// finally move the current log to path.1.
+		_ = os.Remove(fmt.Sprintf("%s.%d", l.path, l.maxBackups))
+		for i := l.maxBackups - 1; i >= 1; i-- {
+			_ = os.Rename(
+				fmt.Sprintf("%s.%d", l.path, i),
+				fmt.Sprintf("%s.%d", l.path, i+1),
+			)
 		}
-		// Remove the oldest backup if it would exceed maxBackups.
-		if i == l.maxBackups {
-			_ = os.Remove(older)
-			continue
-		}
-		// Rename newer → older (shift up).
-		_ = os.Rename(newer, older)
+		_ = os.Rename(l.path, fmt.Sprintf("%s.1", l.path))
 	}
-
-	// Rename current log → .1
-	_ = os.Rename(l.path, fmt.Sprintf("%s.1", l.path))
 
 	// Open a fresh log file.
 	f, err := os.OpenFile(l.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
@@ -231,6 +257,15 @@ func (l *Logger) SetMaxBackups(n int) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.maxBackups = n
+}
+
+// SetLevel sets the minimum log level (one of "debug", "info", "warn",
+// "error"; case-insensitive). Messages below this level are dropped. An
+// unrecognized level enables the most verbose output.
+func (l *Logger) SetLevel(level string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.minLevel = severityOf(level)
 }
 
 // Path returns the log file path. Useful for opening the file in an editor.

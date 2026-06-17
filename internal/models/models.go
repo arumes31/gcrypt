@@ -86,15 +86,11 @@ const (
 	// Magic is the 6-byte magic number identifying gcrypt encrypted files.
 	Magic = "GCRYPT"
 
-	// CurrentVersion is the format version used for single-blob encryption
-	// (EncryptBlob/EncryptFile — e.g. the OAuth token and client secret).
-	CurrentVersion uint16 = 1
-
-	// CurrentStreamVersion is the format version written by EncryptStream. v2
-	// binds a per-chunk "final" marker into each chunk's AAD, authenticating the
-	// chunk count so a truncated or extended ciphertext fails to decrypt. v1
-	// streams (CurrentVersion) lack this and are still accepted on read for
-	// backward compatibility.
+	// CurrentStreamVersion is the encrypted format version. Every value (file
+	// content as well as small blobs like the OAuth token and client secret) is
+	// written with the chunked stream format, whose per-chunk AAD binds a
+	// "final" marker so the chunk count is authenticated and a truncated or
+	// extended ciphertext fails to decrypt.
 	CurrentStreamVersion uint16 = 2
 
 	// HeaderSize is the total size of the encrypted file header in bytes.

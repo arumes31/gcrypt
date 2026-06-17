@@ -10,6 +10,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 
@@ -80,9 +81,40 @@ func main() {
 	}
 	defer func() { _ = logger.Close() }()
 
+	// Route the standard library logger into our log file. Fyne reports GUI
+	// failures (e.g. "Fyne error: window creation error / Cause: WGL: The driver
+	// does not appear to support OpenGL") via the std log package; in the
+	// -H=windowsgui build there is no console, so without this those errors would
+	// be silently lost and the flyout window would just fail to appear.
+	log.SetFlags(0)
+	log.SetOutput(logger.Writer())
+
+	// Apply persisted logging settings (level + rotation) so the configured
+	// values take effect from startup, not just after a runtime change.
+	if cfg != nil {
+		if cfg.App.LogLevel != "" {
+			logger.SetLevel(cfg.App.LogLevel)
+		}
+		if cfg.App.LogMaxSize > 0 {
+			logger.SetMaxSize(int64(cfg.App.LogMaxSize) * 1024 * 1024)
+		}
+		if cfg.App.LogMaxBackups >= 0 {
+			logger.SetMaxBackups(cfg.App.LogMaxBackups)
+		}
+	}
+
 	logger.Info("gcrypt starting", map[string]interface{}{
 		"version": Version,
 	})
+
+	// Ensure the GUI has a usable OpenGL implementation before Fyne initialises.
+	// On Remote Desktop / VMs / broken GPU drivers there is no hardware OpenGL, so
+	// this switches to a bundled software renderer (Mesa llvmpipe) and re-launches
+	// when needed. If it re-launches, the child process takes over and we exit.
+	if ensureWorkingOpenGL(logger.Info) {
+		logger.Info("handing over to software-OpenGL relaunch")
+		return
+	}
 
 	// 3. Create AppController (determines initial state from config).
 	ctrl := service.NewAppController(cfg, logger)
@@ -100,12 +132,14 @@ func main() {
 		}
 	}
 
-	// 5. Start the tray — this is the blocking main loop. All further user
-	//    interaction (setup, passphrase, sign-in) is driven from the tray.
-	trayApp := service.NewTrayApp(ctrl, logger)
-	trayApp.Run()
+	// 5. Start the Fyne GUI — this is the blocking main loop (it must run on
+	//    the main goroutine). It owns the system tray icon/menu and the
+	//    Nextcloud-style flyout window; all further user interaction (setup,
+	//    passphrase, sign-in) is driven from there.
+	ui := service.NewFyneApp(ctrl, logger)
+	ui.Run()
 
-	// After the tray quits, perform final cleanup.
+	// After the GUI quits, perform final cleanup.
 	ctrl.Shutdown()
 
 	logger.Info("gcrypt shutdown complete")

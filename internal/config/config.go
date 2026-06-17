@@ -82,7 +82,6 @@ type OAuthConfig struct {
 // AppConfig holds application-level settings.
 type AppConfig struct {
 	AutoStart          bool   `yaml:"auto_start"`
-	StartMinimized     bool   `yaml:"start_minimized"`
 	RememberPassphrase bool   `yaml:"remember_passphrase"`
 	LogLevel           string `yaml:"log_level"`
 	LogPath            string `yaml:"log_path"`
@@ -127,7 +126,6 @@ func DefaultConfig() *Config {
 		},
 		App: AppConfig{
 			AutoStart:      true,
-			StartMinimized: false,
 			LogLevel:       "info",
 			LogPath:        filepath.Join(gcryptDir, "gcrypt.log"),
 			LogMaxSize:     10,

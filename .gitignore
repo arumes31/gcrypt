@@ -20,6 +20,7 @@ config.yaml.bak
 tokens.enc
 .env
 .env.*
+.secrets
 
 # Local Databases and State
 *.db
@@ -30,6 +31,7 @@ tokens.enc
 
 # Logs
 *.log
+*.txt
 logs/
 
 # IDEs and Editors
@@ -51,3 +53,18 @@ coverage.out
 # Documentation
 *.md
 !README.md
+
+# Generated temporary files
+/temp/
+
+# Scratch / smoke-test / scratch tool output (not needed in the repo)
+se.txt
+so.txt
+smoke_*.txt
+gen_output.txt
+*.scratch
+gcrypt.exe
+
+# Build helper binary (rebuilt from tools/gccwrap source via build.ps1)
+tools/gccwrap/gccwrap.exe
+
