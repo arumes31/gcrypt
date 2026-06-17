@@ -374,9 +374,8 @@ encrypted directory name, and each file is stored under its encrypted parent
 folder with only its (encrypted) basename. This preserves folder structure
 remotely while keeping everything encrypted, and prevents any single Drive folder
 from growing without bound. Folder IDs are cached in memory and created on demand.
-
-> ℹ️ Deleting files leaves now-empty encrypted folders behind on Drive (they are
-> harmless); automatic empty-folder cleanup is not yet implemented.
+When a deletion empties an encrypted folder, gcrypt removes it (and any newly
+empty parent folders) from Drive automatically.
 
 ---
 

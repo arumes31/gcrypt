@@ -1186,6 +1186,13 @@ func (e *Engine) deleteRemote(sf *models.SyncFile) error {
 	e.stats.FilesDeleted++
 	e.mu.Unlock()
 
+	// 4. Best-effort: remove now-empty encrypted parent folders on Drive so a
+	// deletion doesn't leave empty folders behind. Only meaningful when the file
+	// actually lived on Drive (had a RemoteID).
+	if sf.RemoteID != "" {
+		e.pruneEmptyRemoteDirs(path.Dir(filepath.ToSlash(sf.LocalPath)))
+	}
+
 	return nil
 }
 
@@ -1528,6 +1535,120 @@ func (e *Engine) cacheRemoteDir(relDir, folderID string) {
 	e.folderMu.Lock()
 	e.folderCache[relDir] = folderID
 	e.folderMu.Unlock()
+}
+
+// uncacheRemoteDir drops a plaintext relative directory from the folder cache,
+// used after its remote folder has been deleted.
+func (e *Engine) uncacheRemoteDir(slashDir string) {
+	e.folderMu.Lock()
+	delete(e.folderCache, slashDir)
+	e.folderMu.Unlock()
+}
+
+// pruneEmptyRemoteDirs removes now-empty encrypted folders on Drive, walking up
+// from relDir toward the sync root, so deletions don't leave empty folders
+// behind. It is best-effort: any error simply stops the walk (a leftover empty
+// folder is harmless and a later deletion will retry). The pair's root Drive
+// folder is never removed.
+func (e *Engine) pruneEmptyRemoteDirs(relDir string) {
+	slashDir := path.Clean(filepath.ToSlash(relDir))
+	for slashDir != "." && slashDir != "/" && slashDir != "" {
+		id, ok := e.lookupRemoteDirID(slashDir)
+		if !ok || id == e.pair.DriveFolderID {
+			return
+		}
+		empty, err := e.driveFolderIsEmpty(id)
+		if err != nil || !empty {
+			// On error, or while the folder still has contents, stop: ancestors
+			// can't be empty either.
+			return
+		}
+		if err := e.driveClient.DeleteFile(e.ctx, id); err != nil {
+			slog.Warn("prune empty remote folder failed", "dir", slashDir, "error", err)
+			return
+		}
+		e.uncacheRemoteDir(slashDir)
+		slashDir = path.Dir(slashDir)
+	}
+}
+
+// driveFolderIsEmpty reports whether the given Drive folder has no non-trashed
+// children.
+func (e *Engine) driveFolderIsEmpty(folderID string) (bool, error) {
+	files, _, err := e.driveClient.ListFiles(e.ctx, folderID, "")
+	if err != nil {
+		return false, err
+	}
+	return len(files) == 0, nil
+}
+
+// lookupRemoteDirID resolves the Drive folder ID for a plaintext relative
+// directory WITHOUT creating any folders (unlike resolveRemoteDir). It returns
+// false if the folder does not exist remotely. Discovered IDs are cached.
+func (e *Engine) lookupRemoteDirID(slashDir string) (string, bool) {
+	slashDir = path.Clean(slashDir)
+	if slashDir == "." || slashDir == "/" || slashDir == "" {
+		return e.pair.DriveFolderID, true
+	}
+
+	e.folderMu.Lock()
+	cached, ok := e.folderCache[slashDir]
+	e.folderMu.Unlock()
+	if ok {
+		return cached, true
+	}
+
+	parentID := e.pair.DriveFolderID
+	cum := ""
+	for _, comp := range strings.Split(slashDir, "/") {
+		if comp == "" {
+			continue
+		}
+		if cum == "" {
+			cum = comp
+		} else {
+			cum += "/" + comp
+		}
+		e.folderMu.Lock()
+		id, ok := e.folderCache[cum]
+		e.folderMu.Unlock()
+		if ok {
+			parentID = id
+			continue
+		}
+		encName, err := crypto.EncryptFilename(comp, e.masterKey)
+		if err != nil {
+			return "", false
+		}
+		childID, found := e.findChildFolderID(parentID, encName)
+		if !found {
+			return "", false
+		}
+		e.cacheRemoteDir(cum, childID)
+		parentID = childID
+	}
+	return parentID, true
+}
+
+// findChildFolderID returns the ID of the immediate child folder of parentID
+// whose (encrypted) name equals encName, or false if there is no such folder.
+func (e *Engine) findChildFolderID(parentID, encName string) (string, bool) {
+	pageToken := ""
+	for {
+		files, next, err := e.driveClient.ListFiles(e.ctx, parentID, pageToken)
+		if err != nil {
+			return "", false
+		}
+		for _, f := range files {
+			if f.IsFolder() && f.Name == encName {
+				return f.ID, true
+			}
+		}
+		if next == "" {
+			return "", false
+		}
+		pageToken = next
+	}
 }
 
 // ---------------------------------------------------------------------------
