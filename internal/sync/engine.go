@@ -322,7 +322,26 @@ func NewEngine(pair *config.SyncPair, appCfg *config.AppConfig, driveClient *dri
 		opt(e)
 	}
 
+	// Warm the scanner's hash cache from the previous run so a cold start doesn't
+	// re-hash the whole tree. Best-effort: a missing/old cache just means a
+	// regular (re-hashing) first scan.
+	if p := e.hashCachePath(); p != "" {
+		_ = e.scanner.LoadHashCache(p)
+	}
+
 	return e, nil
+}
+
+// hashCachePath returns the on-disk location of this pair's persistent hash
+// cache. It lives alongside the log file (the gcrypt app-data dir), keyed by
+// pair ID, so it is never placed inside the synced tree. Returns "" if no base
+// directory can be determined.
+func (e *Engine) hashCachePath() string {
+	base := filepath.Dir(e.appCfg.LogPath)
+	if base == "" || base == "." {
+		return ""
+	}
+	return filepath.Join(base, "hashcache-"+e.pair.ID+".json")
 }
 
 // ---------------------------------------------------------------------------
@@ -332,6 +351,16 @@ func NewEngine(pair *config.SyncPair, appCfg *config.AppConfig, driveClient *dri
 // ID returns the unique identifier of the sync pair this engine manages.
 func (e *Engine) ID() string {
 	return e.pair.ID
+}
+
+// encName encrypts a plaintext path component to its remote (Drive) name, using
+// the padded format when the pair has filename padding enabled. Decryption
+// auto-detects the format, so a pair can hold a mix of padded and unpadded names.
+func (e *Engine) encName(name string) (string, error) {
+	if e.pair.PadFilenames {
+		return crypto.EncryptFilenamePadded(name, e.masterKey)
+	}
+	return crypto.EncryptFilename(name, e.masterKey)
 }
 
 // SyncNow triggers an immediate full scan cycle, similar to what the remote
@@ -589,6 +618,12 @@ func (e *Engine) scanAndEnqueue() error {
 				}
 			}
 		}
+	}
+
+	// Persist the hash cache so the next startup scan can skip re-hashing files
+	// whose size and mtime are unchanged. Best-effort.
+	if p := e.hashCachePath(); p != "" {
+		_ = e.scanner.SaveHashCache(p)
 	}
 
 	return nil
@@ -1379,7 +1414,7 @@ func (e *Engine) uploadFile(sf *models.SyncFile) error {
 	if err != nil {
 		return fmt.Errorf("sync: resolve remote dir for %s: %w", sf.LocalPath, err)
 	}
-	encryptedName, err := crypto.EncryptFilename(filepath.Base(sf.LocalPath), e.masterKey)
+	encryptedName, err := e.encName(filepath.Base(sf.LocalPath))
 	if err != nil {
 		return fmt.Errorf("sync: encrypt filename %s: %w", sf.LocalPath, err)
 	}
@@ -1639,6 +1674,26 @@ func (e *Engine) downloadFile(sf *models.SyncFile) error {
 // record. The remote file is moved to Drive's trash (not permanently deleted),
 // so a propagated deletion stays recoverable from the Drive trash.
 func (e *Engine) deleteRemote(sf *models.SyncFile) error {
+	// Delete/edit conflict: the local copy was removed, but if the remote copy
+	// was edited since our last sync, trashing it would lose those remote
+	// changes. In a two-way sync the safe resolution is "edit beats delete" —
+	// pull the remote version back locally instead of deleting it. (In
+	// upload-only mode the local side is authoritative, so we still delete.)
+	if sf.RemoteID != "" && e.allowsDownload() {
+		if rf, err := e.driveClient.GetFile(e.ctx, sf.RemoteID); err == nil {
+			if rf.MD5Hash != "" && sf.RemoteHash != "" && rf.MD5Hash != sf.RemoteHash {
+				slog.Warn("delete/edit conflict: remote edited after local delete; restoring local copy",
+					"file", sf.LocalPath)
+				dl := *sf
+				dl.RemoteHash = rf.MD5Hash
+				dl.Size = rf.Size
+				dl.ModTime = rf.ModTime
+				e.enqueueWork(newSyncOperation(&dl, models.OpTypeDownload, e.maxRetries))
+				return nil
+			}
+		}
+	}
+
 	// 1. If RemoteID is not empty, move the remote copy to trash.
 	if sf.RemoteID != "" {
 		if err := e.driveClient.TrashFile(e.ctx, sf.RemoteID); err != nil {
@@ -1672,8 +1727,25 @@ func (e *Engine) deleteRemote(sf *models.SyncFile) error {
 
 // deleteLocal removes a local file and its store record.
 func (e *Engine) deleteLocal(sf *models.SyncFile) error {
-	// 1. Delete the local file.
 	localPath := filepath.Join(e.pair.LocalDir, sf.LocalPath)
+
+	// Delete/edit conflict: the remote copy is gone, but if the local file has
+	// unsynced edits since our last sync, deleting it would lose them. "Edit
+	// beats delete" — re-upload the local copy to recreate it remotely instead.
+	// (Only when uploads are allowed; download-only treats remote as authoritative.)
+	if e.allowsUpload() {
+		if cur, err := e.scanner.ComputeHash(localPath); err == nil && sf.LocalHash != "" && cur != sf.LocalHash {
+			slog.Warn("delete/edit conflict: local edited after remote delete; restoring remote copy",
+				"file", sf.LocalPath)
+			up := *sf
+			up.RemoteID = "" // old remote was deleted/trashed; recreate it
+			up.LocalHash = cur
+			e.enqueueWork(newSyncOperation(&up, models.OpTypeUpload, e.maxRetries))
+			return nil
+		}
+	}
+
+	// 1. Delete the local file.
 	if err := os.Remove(longPath(localPath)); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("sync: delete local file %s: %w", localPath, err)
 	}
@@ -2210,7 +2282,7 @@ func (e *Engine) resolveRemoteDir(relDir string) (string, error) {
 			return "", err
 		}
 		comp := path.Base(slashDir)
-		encName, err := crypto.EncryptFilename(comp, e.masterKey)
+		encName, err := e.encName(comp)
 		if err != nil {
 			return "", fmt.Errorf("encrypt dir component %q: %w", comp, err)
 		}
@@ -2316,7 +2388,7 @@ func (e *Engine) lookupRemoteDirID(slashDir string) (string, bool) {
 			parentID = id
 			continue
 		}
-		encName, err := crypto.EncryptFilename(comp, e.masterKey)
+		encName, err := e.encName(comp)
 		if err != nil {
 			return "", false
 		}

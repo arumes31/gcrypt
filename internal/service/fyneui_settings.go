@@ -358,12 +358,46 @@ func (f *FyneApp) buildPairCard(pairID string) fyne.CanvasObject {
 	}
 	name := pairDisplayName(pair)
 	stateLabel := stateLabelForPair(pairID, manager)
+	if !pair.Enabled {
+		stateLabel = "Disabled"
+	}
 	paused := isPairPaused(pairID, manager)
 
 	title := widget.NewLabelWithStyle(name, fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 	sub := widget.NewLabel(fmt.Sprintf("%s · %s", stateLabel, pair.LocalDir))
 	sub.Importance = widget.LowImportance
 	sub.Wrapping = fyne.TextWrapWord
+
+	// Enable/disable toggle. Disabling stops and removes the running engine (but
+	// keeps the config entry and cloud/local files); enabling starts it again.
+	enabledCheck := widget.NewCheck("Enabled", func(on bool) {
+		c := f.ctrl.Config()
+		if c == nil {
+			return
+		}
+		p := c.GetSyncPair(pairID)
+		if p == nil {
+			return
+		}
+		p.Enabled = on
+		_ = config.Save(config.ConfigPath(), c)
+		go func() {
+			mgr := f.ctrl.Manager()
+			if mgr != nil {
+				if on {
+					if pp := f.ctrl.Config().GetSyncPair(pairID); pp != nil {
+						if err := mgr.AddPair(pp); err != nil && f.logger != nil {
+							f.logger.Warn("enable pair failed", map[string]interface{}{"error": err.Error()})
+						}
+					}
+				} else {
+					_ = mgr.RemovePair(pairID)
+				}
+			}
+			fyne.Do(func() { f.refreshPairs(); f.refresh() })
+		}()
+	})
+	enabledCheck.SetChecked(pair.Enabled)
 
 	// Live per-folder stats + progress, updated in place by updatePairWidgets.
 	metrics := widget.NewLabel("")
@@ -439,8 +473,22 @@ func (f *FyneApp) buildPairCard(pairID string) fyne.CanvasObject {
 	})
 	onlineOnly.SetChecked(pair.OnlineOnly)
 
+	// Filename length padding (set before first sync — toggling later renames
+	// every file on Drive).
+	padNames := widget.NewCheck("Pad filenames to hide length (set before first sync)", func(on bool) {
+		c := f.ctrl.Config()
+		if c == nil {
+			return
+		}
+		if p := c.GetSyncPair(pairID); p != nil {
+			p.PadFilenames = on
+			_ = config.Save(config.ConfigPath(), c)
+		}
+	})
+	padNames.SetChecked(pair.PadFilenames)
+
 	// "Download online-only files" button, shown only when there are some.
-	onDemandRow := container.NewVBox(onlineOnly)
+	onDemandRow := container.NewVBox(onlineOnly, padNames)
 	if manager != nil {
 		if n := manager.OnlineOnlyCount(pairID); n > 0 {
 			availBtn := widget.NewButtonWithIcon(
@@ -498,7 +546,7 @@ func (f *FyneApp) buildPairCard(pairID string) fyne.CanvasObject {
 	removeBtn.Importance = widget.DangerImportance
 
 	controls := container.NewGridWithColumns(4, pauseBtn, syncBtn, openBtn, removeBtn)
-	card := container.NewVBox(title, sub, metrics, pairProgress,
+	card := container.NewVBox(title, sub, enabledCheck, metrics, pairProgress,
 		intervalRow, directionRow, conflictRow, onDemandRow, controls, widget.NewSeparator())
 
 	// Paint the live widgets once now so the card isn't blank until the next tick.

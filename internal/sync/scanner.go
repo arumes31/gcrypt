@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -25,6 +26,58 @@ type hashCacheEntry struct {
 	size    int64
 	modTime time.Time
 	digest  string
+}
+
+// persistedHashEntry is the JSON-serialisable form of hashCacheEntry, used to
+// persist the hash cache across restarts so a cold start doesn't re-hash the
+// whole tree. ModTime marshals as RFC3339Nano, so it round-trips exactly.
+type persistedHashEntry struct {
+	Size    int64     `json:"size"`
+	ModTime time.Time `json:"mtime"`
+	Digest  string    `json:"hash"`
+}
+
+// LoadHashCache seeds the in-memory hash cache from a JSON file previously
+// written by SaveHashCache. A missing or unreadable file is not an error from
+// the caller's perspective (it just means a cold start). Entries are validated
+// against the live file stamp on use, so a stale entry can never return a wrong
+// hash — at worst it forces a recompute.
+func (s *Scanner) LoadHashCache(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var in map[string]persistedHashEntry
+	if err := json.Unmarshal(data, &in); err != nil {
+		return err
+	}
+	s.muCache.Lock()
+	for k, v := range in {
+		s.hashCache[k] = hashCacheEntry{size: v.Size, modTime: v.ModTime, digest: v.Digest}
+	}
+	s.muCache.Unlock()
+	return nil
+}
+
+// SaveHashCache writes the in-memory hash cache to path atomically (temp file +
+// rename) so a crash can't leave a half-written cache.
+func (s *Scanner) SaveHashCache(path string) error {
+	s.muCache.RLock()
+	out := make(map[string]persistedHashEntry, len(s.hashCache))
+	for k, v := range s.hashCache {
+		out[k] = persistedHashEntry{Size: v.size, ModTime: v.modTime, Digest: v.digest}
+	}
+	s.muCache.RUnlock()
+
+	data, err := json.Marshal(out)
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // Scanner performs full and single-file directory scans, producing

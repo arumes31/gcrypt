@@ -86,6 +86,7 @@ type SyncPair struct {
 	SyncDirection   SyncDirection  `yaml:"sync_direction"`    // data-flow policy
 	ConflictPolicy  ConflictPolicy `yaml:"conflict_policy"`   // conflict resolution strategy
 	OnlineOnly      bool           `yaml:"online_only"`       // create placeholders instead of downloading
+	PadFilenames    bool           `yaml:"pad_filenames"`     // pad encrypted names to hide length (set before first sync)
 }
 
 // EncryptionConfig holds encryption-related settings.
