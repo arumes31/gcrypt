@@ -9,7 +9,13 @@ on:
 jobs:
   lint-and-test:
     name: Lint and Test
-    runs-on: ubuntu-latest
+    # gcrypt is a Windows-only application: several packages import
+    # golang.org/x/sys/windows and the GUI uses cgo (Fyne/GLFW). It therefore
+    # only compiles on Windows, so linting, vetting, security scanning and tests
+    # all run on a Windows runner (which ships a cgo-capable gcc).
+    runs-on: windows-latest
+    env:
+      CGO_ENABLED: "1"
     steps:
       - uses: actions/checkout@v6
         with:
@@ -21,11 +27,6 @@ jobs:
           go-version-file: 'go.mod'
           cache: true
 
-      # Fyne (the GUI toolkit) uses cgo + OpenGL/X11, so linting, vetting,
-      # testing and building all need these system headers on Linux.
-      - name: Install Fyne build dependencies
-        run: sudo apt-get update && sudo apt-get install -y gcc libgl1-mesa-dev xorg-dev libxkbcommon-dev
-
       - name: Verify dependencies
         run: go mod verify
 
@@ -35,22 +36,30 @@ jobs:
           version: latest
 
       - name: Run Gosec Security Scanner
-        uses: securego/gosec@master
-        with:
-          args: ./...
+        run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@latest
+          gosec ./...
 
       - name: Run Govulncheck
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest
           govulncheck ./...
 
+      - name: Run Tests
+        run: go test -v ./...
+
+  secret-scan:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
       - name: Gitleaks Scan
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Run Tests
-        run: go test -v ./...
 
   build-windows:
     name: Build Windows Binary
