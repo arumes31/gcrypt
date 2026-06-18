@@ -58,9 +58,9 @@ type SyncDirection string
 
 const (
 	SyncDirTwoWay       SyncDirection = "two_way"       // full bidirectional (default)
-	SyncDirUploadOnly   SyncDirection = "upload_only"    // local → remote only
-	SyncDirDownloadOnly SyncDirection = "download_only"  // remote → local only
-	SyncDirMirror       SyncDirection = "mirror"         // local → remote, no remote deletes
+	SyncDirUploadOnly   SyncDirection = "upload_only"   // local → remote only
+	SyncDirDownloadOnly SyncDirection = "download_only" // remote → local only
+	SyncDirMirror       SyncDirection = "mirror"        // local → remote, no remote deletes
 )
 
 // ConflictPolicy determines how a sync conflict is resolved.
@@ -83,11 +83,11 @@ type SyncPair struct {
 	IgnorePatterns  []string       `yaml:"ignore_patterns"`
 	SyncInterval    int            `yaml:"sync_interval"`
 	SelectedFolders []string       `yaml:"selected_folders"`
-	ForwardOnly     bool           `yaml:"forward_only"`      // DEPRECATED: migrated to SyncDirection
-	SyncDirection   SyncDirection  `yaml:"sync_direction"`    // data-flow policy
-	ConflictPolicy  ConflictPolicy `yaml:"conflict_policy"`   // conflict resolution strategy
-	OnlineOnly      bool           `yaml:"online_only"`       // create placeholders instead of downloading
-	PadFilenames    bool           `yaml:"pad_filenames"`     // pad encrypted names to hide length (set before first sync)
+	ForwardOnly     bool           `yaml:"forward_only"`    // DEPRECATED: migrated to SyncDirection
+	SyncDirection   SyncDirection  `yaml:"sync_direction"`  // data-flow policy
+	ConflictPolicy  ConflictPolicy `yaml:"conflict_policy"` // conflict resolution strategy
+	OnlineOnly      bool           `yaml:"online_only"`     // create placeholders instead of downloading
+	PadFilenames    bool           `yaml:"pad_filenames"`   // pad encrypted names to hide length (set before first sync)
 }
 
 // EncryptionConfig holds encryption-related settings.
@@ -161,12 +161,12 @@ func DefaultConfig() *Config {
 			PassphraseHash: "",
 		},
 		App: AppConfig{
-			AutoStart:      true,
-			LogLevel:       "info",
-			LogPath:        filepath.Join(gcryptDir, "gcrypt.log"),
-			LogMaxSize:     10,
-			LogMaxBackups:  3,
-			MaxFileSize:    0,
+			AutoStart:     true,
+			LogLevel:      "info",
+			LogPath:       filepath.Join(gcryptDir, "gcrypt.log"),
+			LogMaxSize:    10,
+			LogMaxBackups: 3,
+			MaxFileSize:   0,
 		},
 	}
 }
@@ -248,7 +248,7 @@ func (c *Config) CanAddPair(localDir, driveFolderID string) error {
 			return fmt.Errorf("local folder %q overlaps an existing sync folder %q", localDir, p.LocalDir)
 		}
 		if driveFolderID != "" && driveFolderID == p.DriveFolderID {
-			return fmt.Errorf("Drive folder %q is already used by another sync pair", driveFolderID)
+			return fmt.Errorf("drive folder %q is already used by another sync pair", driveFolderID)
 		}
 	}
 	return nil
@@ -489,7 +489,7 @@ func ConfigPath() string {
 // If the file contains a V1 format (no "version" key or version=1), it is
 // automatically migrated to V2 and saved back.
 func Load(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) // #nosec G304 -- path is the app's config file location (flag/default), not untrusted input
 	if err != nil {
 		return nil, err
 	}
@@ -528,7 +528,7 @@ func migrateV1(path string, data []byte) (*Config, error) {
 
 	// Create backup of the original V1 file.
 	backupPath := path + ".v1.bak"
-	if err := os.WriteFile(backupPath, data, 0600); err != nil {
+	if err := os.WriteFile(backupPath, data, 0600); err != nil { // #nosec G703 -- backupPath is derived from the app's own config path
 		return nil, fmt.Errorf("creating V1 backup: %w", err)
 	}
 

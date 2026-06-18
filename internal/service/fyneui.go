@@ -108,9 +108,9 @@ type FyneApp struct {
 	// Header widgets.
 	statusDot   *canvas.Circle
 	statusLabel *widget.Label
-	summary     *widget.Label // sync folder path
-	metrics     *widget.Label // cumulative counts + transfer rate
-	liveLabel   *widget.Label // current in-flight file(s) + pending
+	summary     *widget.Label       // sync folder path
+	metrics     *widget.Label       // cumulative counts + transfer rate
+	liveLabel   *widget.Label       // current in-flight file(s) + pending
 	progress    *widget.ProgressBar // overall sync progress (done / total)
 
 	// Account / Drive-quota widgets (Settings tab; updated by a background poll).
@@ -140,8 +140,8 @@ type FyneApp struct {
 
 	// Live "now transferring" panel (top of Activity tab) + its last-rendered
 	// signature, so it's only rebuilt when the in-flight set actually changes.
-	liveTransfers   *fyne.Container
-	lastLiveSig     string
+	liveTransfers *fyne.Container
+	lastLiveSig   string
 
 	// Search/filter text for the Activity and Folders tabs (lower-cased).
 	activityFilter string
@@ -1071,7 +1071,7 @@ func (f *FyneApp) openSyncFolder() {
 	if dir == "" {
 		return
 	}
-	if err := exec.Command("explorer", dir).Start(); err != nil {
+	if err := exec.CommandContext(context.Background(), "explorer", dir).Start(); err != nil { // #nosec G204 -- fixed command; dir is the app's configured sync folder
 		fmt.Fprintf(os.Stderr, "service: open sync folder: %v\n", err)
 	}
 }
@@ -1089,7 +1089,7 @@ func (f *FyneApp) viewLog() {
 	if path == "" {
 		return
 	}
-	if err := exec.Command("notepad", path).Start(); err != nil {
+	if err := exec.CommandContext(context.Background(), "notepad", path).Start(); err != nil { // #nosec G204 -- fixed command; path is the app's own log file
 		fmt.Fprintf(os.Stderr, "service: view log: %v\n", err)
 	}
 }

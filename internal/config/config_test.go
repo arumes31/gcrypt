@@ -144,7 +144,7 @@ func TestV1Migration(t *testing.T) {
 	backupPath := configPath + ".v1.bak"
 
 	// Write a V1 config file (no version key).
-	v1 := v1Config{
+	v1 := v1Config{ // #nosec G101 -- test fixture; PassphraseHash is a dummy, not a real credential
 		SyncDir:        "/home/user/GcryptDrive",
 		DriveFolderID:  "1aBcDeFgHiJkLmNoPqRsTuVwXyZ",
 		PassphraseHash: "argon2id$v=19$m=262144,t=4,p=4$hash",
@@ -211,7 +211,7 @@ func TestV1Migration(t *testing.T) {
 	}
 
 	// Verify the file on disk is now V2.
-	raw, err := os.ReadFile(configPath)
+	raw, err := os.ReadFile(configPath) // #nosec G304 -- configPath is a test temp file
 	if err != nil {
 		t.Fatalf("read migrated config: %v", err)
 	}

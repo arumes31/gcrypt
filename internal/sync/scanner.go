@@ -19,7 +19,6 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-
 // hashCacheEntry is a cached content hash together with the file stamp it was
 // computed from, so the cache can be invalidated when the file changes.
 type hashCacheEntry struct {
@@ -44,7 +43,7 @@ type persistedHashEntry struct {
 // against the live file stamp on use, so a stale entry can never return a wrong
 // hash — at worst it forces a recompute.
 func (s *Scanner) LoadHashCache(path string) error {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) // #nosec G304 -- path is the app's own hash-cache file under its data dir
 	if err != nil {
 		return err
 	}
@@ -399,7 +398,7 @@ func (s *Scanner) ComputeHash(path string) (string, error) {
 		}
 	}
 
-	f, err := os.Open(absPath)
+	f, err := os.Open(absPath) // #nosec G304 -- absPath is a file within the configured sync root being hashed
 	if err != nil {
 		return "", fmt.Errorf("open for hash: %w", err)
 	}

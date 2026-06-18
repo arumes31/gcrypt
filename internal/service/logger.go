@@ -71,7 +71,7 @@ func NewLogger(path string) (*Logger, error) {
 		return nil, fmt.Errorf("service: create log directory: %w", err)
 	}
 
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600) // #nosec G304 -- path is the app's configured log file location
 	if err != nil {
 		return nil, fmt.Errorf("service: open log file: %w", err)
 	}

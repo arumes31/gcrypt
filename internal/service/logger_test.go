@@ -31,7 +31,7 @@ func TestLoggerRotationKeepsCorrectBackups(t *testing.T) {
 	}
 
 	read := func(p string) string {
-		b, err := os.ReadFile(p)
+		b, err := os.ReadFile(p) // #nosec G304 -- p is a test temp file
 		if err != nil {
 			t.Fatalf("read %s: %v", p, err)
 		}
@@ -73,7 +73,7 @@ func TestLoggerLevelFiltering(t *testing.T) {
 	logger.Warn("wrn-message")
 	logger.Error("err-message")
 
-	b, err := os.ReadFile(path)
+	b, err := os.ReadFile(path) // #nosec G304 -- path is a test temp file
 	if err != nil {
 		t.Fatalf("read log: %v", err)
 	}

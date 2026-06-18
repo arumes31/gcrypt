@@ -110,7 +110,7 @@ func encryptFilename(plaintext string, masterKey []byte, pad bool) (string, erro
 			return "", fmt.Errorf("crypto: filename too long to pad (%d bytes, max %d)", len(nb), 0xFFFF)
 		}
 		padded := make([]byte, roundUpFilename(2+len(nb)))
-		binary.LittleEndian.PutUint16(padded[0:2], uint16(len(nb)))
+		binary.LittleEndian.PutUint16(padded[0:2], uint16(len(nb))) // #nosec G115 -- len(nb) is bounded to <= 0xFFFF by the guard above
 		copy(padded[2:], nb)
 		payload = padded
 	}

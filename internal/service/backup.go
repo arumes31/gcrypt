@@ -49,13 +49,13 @@ func ExportBackup(destDir string) ([]string, error) {
 
 // copyFileSecure copies src to dst, creating dst with owner-only permissions.
 func copyFileSecure(src, dst string) error {
-	in, err := os.Open(src)
+	in, err := os.Open(src) // #nosec G304 -- src/dst are app-controlled config/backup paths, not user input
 	if err != nil {
 		return err
 	}
 	defer func() { _ = in.Close() }()
 
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600) // #nosec G304 -- src/dst are app-controlled config/backup paths, not user input
 	if err != nil {
 		return err
 	}

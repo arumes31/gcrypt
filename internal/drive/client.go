@@ -281,7 +281,7 @@ func (c *Client) UploadFile(ctx context.Context, name string, parentID string, c
 func (c *Client) DownloadFile(ctx context.Context, fileID string) (io.ReadCloser, error) {
 	resp, err := c.svc.Files.Get(fileID).
 		Context(ctx).
-		Download()
+		Download() //nolint:bodyclose // resp.Body is wrapped and returned to the caller, which closes it
 	if err != nil {
 		return nil, wrapAPIError(err)
 	}

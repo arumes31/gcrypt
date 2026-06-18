@@ -74,7 +74,8 @@ func GetTokenFromWebBrowser(config *oauth2.Config) (*oauth2.Token, error) {
 	openBrowser(authURL)
 
 	// Listen on port 8089 and wait for the callback.
-	listener, err := net.Listen("tcp", "localhost:8089")
+	var lc net.ListenConfig
+	listener, err := lc.Listen(context.Background(), "tcp", "localhost:8089")
 	if err != nil {
 		return nil, fmt.Errorf("drive: failed to listen on localhost:8089: %w", err)
 	}
@@ -82,7 +83,9 @@ func GetTokenFromWebBrowser(config *oauth2.Config) (*oauth2.Token, error) {
 	codeCh := make(chan string, 1)
 	errCh := make(chan error, 1)
 
-	srv := &http.Server{}
+	// ReadHeaderTimeout is set in the struct literal (not assigned afterwards) so
+	// static analysers can see this server is not vulnerable to Slowloris.
+	srv := &http.Server{ReadHeaderTimeout: 10 * time.Second}
 	srv.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/callback" {
 			http.NotFound(w, r)
@@ -106,8 +109,6 @@ func GetTokenFromWebBrowser(config *oauth2.Config) (*oauth2.Token, error) {
 		_, _ = fmt.Fprintln(w, "Authorization successful! You can close this tab.")
 		codeCh <- code
 	})
-
-	srv.ReadHeaderTimeout = 10 * time.Second
 
 	go func() {
 		if err := srv.Serve(listener); err != nil && err != http.ErrServerClosed {
@@ -147,14 +148,17 @@ func GetTokenFromWebBrowser(config *oauth2.Config) (*oauth2.Token, error) {
 // implementation varies by OS; on Windows it uses rundll32, on Darwin it uses
 // the open command, and on Linux/other it uses xdg-open.
 func openBrowser(url string) {
+	// The command names are fixed constants and the only variable argument is the
+	// OAuth authorization URL this package just built — not attacker input — so
+	// the G204 "subprocess from variable" warnings are audited and suppressed.
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "windows":
-		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
+		cmd = exec.CommandContext(context.Background(), "rundll32", "url.dll,FileProtocolHandler", url) // #nosec G204 -- fixed command; url is our own OAuth URL
 	case "darwin":
-		cmd = exec.Command("open", url)
+		cmd = exec.CommandContext(context.Background(), "open", url) // #nosec G204 -- fixed command; url is our own OAuth URL
 	default:
-		cmd = exec.Command("xdg-open", url)
+		cmd = exec.CommandContext(context.Background(), "xdg-open", url) // #nosec G204 -- fixed command; url is our own OAuth URL
 	}
 	// Best-effort: ignore errors if the browser cannot be opened.
 	_ = cmd.Run()
@@ -165,7 +169,10 @@ func openBrowser(url string) {
 // JSON-marshalled and then encrypted using crypto.EncryptBytes with the path
 // "gcrypt://oauth-token" as AAD.
 func SaveToken(path string, token *oauth2.Token, masterKey []byte) error {
-	data, err := json.Marshal(token)
+	// Marshalling the token deliberately includes the access/refresh tokens — the
+	// JSON is immediately encrypted with the master key below and never written in
+	// the clear, so the G117 "secret in marshalled struct" warning is by design.
+	data, err := json.Marshal(token) // #nosec G117 -- token JSON is encrypted before being persisted
 	if err != nil {
 		return fmt.Errorf("drive: failed to marshal token: %w", err)
 	}
@@ -192,7 +199,7 @@ func SaveToken(path string, token *oauth2.Token, masterKey []byte) error {
 // master key using crypto.DecryptBytes with the path "gcrypt://oauth-token"
 // as AAD, and unmarshals the JSON into an *oauth2.Token.
 func LoadToken(path string, masterKey []byte) (*oauth2.Token, error) {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) // #nosec G304 -- path is the app's own token file location, not user input
 	if err != nil {
 		return nil, fmt.Errorf("drive: failed to read token file: %w", err)
 	}

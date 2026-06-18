@@ -32,7 +32,7 @@ func hideConsoleIfOwned() {
 	// If only one process is attached to this console, it's ours alone and safe
 	// to hide. More than one means we share a parent terminal — leave it.
 	var pids [2]uint32
-	n, _, _ := getConsoleProcessList.Call(uintptr(unsafe.Pointer(&pids[0])), uintptr(len(pids)))
+	n, _, _ := getConsoleProcessList.Call(uintptr(unsafe.Pointer(&pids[0])), uintptr(len(pids))) // #nosec G103 -- required Win32 syscall pointer marshalling
 	if int(n) == 1 {
 		const swHide = 0
 		_, _, _ = showWindow.Call(hwnd, swHide)
