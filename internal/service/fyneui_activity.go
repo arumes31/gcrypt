@@ -2,6 +2,7 @@ package service
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -67,12 +68,29 @@ func (f *FyneApp) refreshActivity() {
 		events = manager.RecentActivity(activityFeedLimit)
 	}
 
+	// Apply the Activity-tab search filter (matches file name or relative path).
+	if f.activityFilter != "" {
+		filtered := make([]syncpkg.ActivityEvent, 0, len(events))
+		for _, ev := range events {
+			if strings.Contains(strings.ToLower(ev.Name), f.activityFilter) ||
+				strings.Contains(strings.ToLower(ev.Path), f.activityFilter) {
+				filtered = append(filtered, ev)
+			}
+		}
+		events = filtered
+	}
+
 	f.mu.Lock()
 	f.events = events
 	n := len(events)
 	f.mu.Unlock()
 
 	if n == 0 {
+		if f.activityFilter != "" {
+			f.emptyHint.SetText("No activity matches your search.")
+		} else {
+			f.emptyHint.SetText("Nothing yet — changes will show up here as they sync.")
+		}
 		f.emptyHint.Show()
 	} else {
 		f.emptyHint.Hide()

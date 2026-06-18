@@ -80,9 +80,10 @@ type SyncStats struct {
 // SyncActivity is a point-in-time snapshot of in-flight and queued work,
 // used to drive the tray's live activity display.
 type SyncActivity struct {
-	Pending int      // operations waiting in the work queue
-	Active  int      // operations currently being processed
-	Current []string // short descriptions of the in-flight operations (e.g. "↑ report.pdf")
+	Pending      int      // operations waiting in the work queue
+	PendingBytes int64    // total bytes of queued + in-flight transfer ops (uploads/downloads)
+	Active       int      // operations currently being processed
+	Current      []string // short descriptions of the in-flight operations (e.g. "↑ report.pdf")
 }
 
 // ActivityKind classifies a completed sync event for the activity feed.
@@ -142,6 +143,13 @@ type Engine struct {
 	// real backlog size, independent of the bounded workQueue channel buffer.
 	// Accessed atomically.
 	pendingOps int64
+
+	// pendingBytes mirrors pendingOps but sums the byte size of outstanding
+	// transfer operations (uploads/downloads), so the UI can show byte-based
+	// progress and an ETA rather than a file-count ratio that jumps when a large
+	// file follows many tiny ones. Accessed atomically; incremented/decremented
+	// in lock-step with pendingOps.
+	pendingBytes int64
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -653,12 +661,28 @@ func (e *Engine) enqueueWork(op *models.SyncOperation) {
 	// when the operation terminally completes in the worker. Retry/pause
 	// re-enqueues send to the channel directly and must not be counted here.
 	atomic.AddInt64(&e.pendingOps, 1)
+	atomic.AddInt64(&e.pendingBytes, opBytes(op))
 	select {
 	case e.workQueue <- op:
 	case <-e.ctx.Done():
 		// Engine is shutting down — this operation will never run, so undo
 		// the backlog increment to keep the pending counter accurate.
 		atomic.AddInt64(&e.pendingOps, -1)
+		atomic.AddInt64(&e.pendingBytes, -opBytes(op))
+	}
+}
+
+// opBytes returns the byte size a transfer operation contributes to the pending
+// backlog. Only uploads and downloads move bytes; deletes/conflicts count as 0.
+func opBytes(op *models.SyncOperation) int64 {
+	if op == nil || op.File == nil {
+		return 0
+	}
+	switch op.OpType {
+	case models.OpTypeUpload, models.OpTypeDownload:
+		return op.File.Size
+	default:
+		return 0
 	}
 }
 
@@ -673,11 +697,13 @@ func (e *Engine) enqueueWork(op *models.SyncOperation) {
 // cancellation, decrementing the counter if the op never makes it onto the queue.
 func (e *Engine) enqueueDetached(op *models.SyncOperation) {
 	atomic.AddInt64(&e.pendingOps, 1)
+	atomic.AddInt64(&e.pendingBytes, opBytes(op))
 	go func() {
 		select {
 		case e.workQueue <- op:
 		case <-e.ctx.Done():
 			atomic.AddInt64(&e.pendingOps, -1)
+			atomic.AddInt64(&e.pendingBytes, -opBytes(op))
 		}
 	}()
 }
@@ -799,8 +825,9 @@ func (e *Engine) Activity() SyncActivity {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	act := SyncActivity{
-		Pending: int(atomic.LoadInt64(&e.pendingOps)),
-		Active:  len(e.activeOps),
+		Pending:      int(atomic.LoadInt64(&e.pendingOps)),
+		PendingBytes: atomic.LoadInt64(&e.pendingBytes),
+		Active:       len(e.activeOps),
 	}
 	if len(e.activeOps) > 0 {
 		act.Current = make([]string, 0, len(e.activeOps))
@@ -1308,6 +1335,7 @@ func (e *Engine) runWorker(id int) {
 							// Context cancelled during backoff — the op will
 							// never run, so drop it from the backlog.
 							atomic.AddInt64(&e.pendingOps, -1)
+							atomic.AddInt64(&e.pendingBytes, -opBytes(op))
 						}
 					}(op, delay)
 				} else {
@@ -1319,11 +1347,13 @@ func (e *Engine) runWorker(id int) {
 					e.sendError(fmt.Errorf("sync: max retries exceeded for %s %s: %w",
 						op.OpType, op.File.LocalPath, err))
 					atomic.AddInt64(&e.pendingOps, -1)
+					atomic.AddInt64(&e.pendingBytes, -opBytes(op))
 				}
 			} else {
 				// Operation succeeded — terminal. Clear it from the backlog,
 				// record it for the activity feed, and update the last sync time.
 				atomic.AddInt64(&e.pendingOps, -1)
+				atomic.AddInt64(&e.pendingBytes, -opBytes(op))
 				e.recordEvent(op)
 				e.mu.Lock()
 				e.stats.LastSyncTime = time.Now()

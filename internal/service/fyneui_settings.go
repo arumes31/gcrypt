@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
@@ -250,8 +251,19 @@ func (f *FyneApp) buildSettingsTab() fyne.CanvasObject {
 	quietRow := container.NewBorder(nil, nil, widget.NewLabel("Quiet hours"), nil,
 		container.NewGridWithColumns(3, quietStart, widget.NewLabel("to"), quietEnd))
 
+	// Security section: make the encryption guarantee explicit and discoverable.
+	secNote := widget.NewLabel("🔒 End-to-end encrypted — AES-256-GCM.\nFiles and their names are encrypted on this PC before upload; your passphrase never leaves this device, so Google only ever stores ciphertext.")
+	secNote.Wrapping = fyne.TextWrapWord
+	secNote.Importance = widget.LowImportance
+	securitySection := container.NewVBox(
+		widget.NewLabelWithStyle("Security", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		secNote,
+		widget.NewSeparator(),
+	)
+
 	body := container.NewVBox(
 		accountSection,
+		securitySection,
 		widget.NewLabelWithStyle("General", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		autoStart,
 		rememberPass,
@@ -335,14 +347,29 @@ func (f *FyneApp) refreshPairs() {
 
 	cfg := f.ctrl.Config()
 	if cfg == nil || len(cfg.SyncPairs) == 0 {
-		f.pairsContainer.Add(widget.NewLabel("No sync folders configured."))
+		hint := widget.NewLabel("No sync folders yet.\nClick “Add Sync Folder…” to start an end-to-end encrypted sync with Google Drive.")
+		hint.Wrapping = fyne.TextWrapWord
+		hint.Alignment = fyne.TextAlignCenter
+		f.pairsContainer.Add(hint)
 		f.pairsContainer.Refresh()
 		return
 	}
 
+	shown := 0
 	for i := range cfg.SyncPairs {
 		pair := &cfg.SyncPairs[i]
+		if f.folderFilter != "" &&
+			!strings.Contains(strings.ToLower(pairDisplayName(pair)), f.folderFilter) &&
+			!strings.Contains(strings.ToLower(pair.LocalDir), f.folderFilter) {
+			continue
+		}
 		f.pairsContainer.Add(f.buildPairCard(pair.ID))
+		shown++
+	}
+	if shown == 0 {
+		none := widget.NewLabel("No folders match your filter.")
+		none.Alignment = fyne.TextAlignCenter
+		f.pairsContainer.Add(none)
 	}
 	f.pairsContainer.Refresh()
 }
@@ -367,6 +394,14 @@ func (f *FyneApp) buildPairCard(pairID string) fyne.CanvasObject {
 	sub := widget.NewLabel(fmt.Sprintf("%s · %s", stateLabel, pair.LocalDir))
 	sub.Importance = widget.LowImportance
 	sub.Wrapping = fyne.TextWrapWord
+
+	// Per-folder encryption indicator (and whether filename length is hidden).
+	encInfo := "🔒 Encrypted"
+	if pair.PadFilenames {
+		encInfo += "  ·  filename length hidden"
+	}
+	encLabel := widget.NewLabel(encInfo)
+	encLabel.Importance = widget.LowImportance
 
 	// Enable/disable toggle. Disabling stops and removes the running engine (but
 	// keeps the config entry and cloud/local files); enabling starts it again.
@@ -546,7 +581,7 @@ func (f *FyneApp) buildPairCard(pairID string) fyne.CanvasObject {
 	removeBtn.Importance = widget.DangerImportance
 
 	controls := container.NewGridWithColumns(4, pauseBtn, syncBtn, openBtn, removeBtn)
-	card := container.NewVBox(title, sub, enabledCheck, metrics, pairProgress,
+	card := container.NewVBox(title, sub, encLabel, enabledCheck, metrics, pairProgress,
 		intervalRow, directionRow, conflictRow, onDemandRow, controls, widget.NewSeparator())
 
 	// Paint the live widgets once now so the card isn't blank until the next tick.
