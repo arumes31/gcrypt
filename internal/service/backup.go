@@ -30,7 +30,7 @@ func ExportBackup(destDir string) ([]string, error) {
 	if destDir == "" {
 		return nil, fmt.Errorf("service: no backup destination selected")
 	}
-	if err := os.MkdirAll(destDir, 0750); err != nil {
+	if err := os.MkdirAll(destDir, 0700); err != nil {
 		return nil, fmt.Errorf("service: creating backup dir: %w", err)
 	}
 
@@ -61,6 +61,7 @@ func copyFileSecure(src, dst string) error {
 	}
 	if _, err := io.Copy(out, in); err != nil {
 		_ = out.Close()
+		_ = os.Remove(dst) // don't leave a partial/corrupt backup behind
 		return err
 	}
 	return out.Close()

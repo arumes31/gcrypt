@@ -54,7 +54,7 @@ func TestDefaultConfig(t *testing.T) {
 
 func TestDefaultIgnorePatterns(t *testing.T) {
 	patterns := DefaultIgnorePatterns()
-	expected := []string{"~$*", "*.tmp", "*.swp", ".DS_Store", "Thumbs.db", "desktop.ini"}
+	expected := []string{"~$*", "*~", ".~lock.*#", "*.lock", "*.tmp", "*.swp", ".DS_Store", "Thumbs.db", "desktop.ini"}
 	if len(patterns) != len(expected) {
 		t.Fatalf("DefaultIgnorePatterns length = %d, want %d", len(patterns), len(expected))
 	}

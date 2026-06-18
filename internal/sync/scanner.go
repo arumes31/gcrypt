@@ -38,8 +38,9 @@ type persistedHashEntry struct {
 }
 
 // LoadHashCache seeds the in-memory hash cache from a JSON file previously
-// written by SaveHashCache. A missing or unreadable file is not an error from
-// the caller's perspective (it just means a cold start). Entries are validated
+// written by SaveHashCache. It returns the underlying error when the file is
+// missing or unreadable (and on malformed JSON), so the caller can distinguish a
+// cold start — a missing cache file — from a corrupt one. Entries are validated
 // against the live file stamp on use, so a stale entry can never return a wrong
 // hash — at worst it forces a recompute.
 func (s *Scanner) LoadHashCache(path string) error {

@@ -16,11 +16,14 @@ func longPath(p string) string {
 	if p == "" || strings.HasPrefix(p, `\\?\`) {
 		return p
 	}
-	if len(p) < 248 {
-		return p
-	}
+	// Resolve to an absolute path first: a short relative path can still expand
+	// to a long absolute path under a deep working directory, and only the
+	// resolved length determines whether MAX_PATH is exceeded.
 	abs, err := filepath.Abs(p)
 	if err != nil {
+		return p
+	}
+	if len(abs) < 248 {
 		return p
 	}
 	if strings.HasPrefix(abs, `\\`) {

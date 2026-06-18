@@ -662,6 +662,26 @@ func (e *Engine) enqueueWork(op *models.SyncOperation) {
 	}
 }
 
+// enqueueDetached schedules a brand-new operation without ever blocking the
+// caller. It MUST be used instead of enqueueWork whenever the caller is itself a
+// worker goroutine (e.g. deleteRemote/deleteLocal resolving a delete/edit
+// conflict): enqueueWork does a blocking send, so a worker calling it while the
+// queue is full would stall the very goroutines that drain the queue — a
+// deadlock that manifests as uploads no longer being processed. Like
+// enqueueWork it counts the op against the backlog (it is a new op, not a
+// retry), but the send happens on a detached goroutine and honours ctx
+// cancellation, decrementing the counter if the op never makes it onto the queue.
+func (e *Engine) enqueueDetached(op *models.SyncOperation) {
+	atomic.AddInt64(&e.pendingOps, 1)
+	go func() {
+		select {
+		case e.workQueue <- op:
+		case <-e.ctx.Done():
+			atomic.AddInt64(&e.pendingOps, -1)
+		}
+	}()
+}
+
 // Stop performs a graceful shutdown of the sync engine.
 func (e *Engine) Stop() error {
 	e.setState(StatePaused)
@@ -1688,7 +1708,7 @@ func (e *Engine) deleteRemote(sf *models.SyncFile) error {
 				dl.RemoteHash = rf.MD5Hash
 				dl.Size = rf.Size
 				dl.ModTime = rf.ModTime
-				e.enqueueWork(newSyncOperation(&dl, models.OpTypeDownload, e.maxRetries))
+				e.enqueueDetached(newSyncOperation(&dl, models.OpTypeDownload, e.maxRetries))
 				return nil
 			}
 		}
@@ -1740,7 +1760,7 @@ func (e *Engine) deleteLocal(sf *models.SyncFile) error {
 			up := *sf
 			up.RemoteID = "" // old remote was deleted/trashed; recreate it
 			up.LocalHash = cur
-			e.enqueueWork(newSyncOperation(&up, models.OpTypeUpload, e.maxRetries))
+			e.enqueueDetached(newSyncOperation(&up, models.OpTypeUpload, e.maxRetries))
 			return nil
 		}
 	}

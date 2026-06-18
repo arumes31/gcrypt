@@ -106,6 +106,9 @@ func encryptFilename(plaintext string, masterKey []byte, pad bool) (string, erro
 	payload := []byte(plaintext)
 	if pad {
 		nb := []byte(plaintext)
+		if len(nb) > 0xFFFF {
+			return "", fmt.Errorf("crypto: filename too long to pad (%d bytes, max %d)", len(nb), 0xFFFF)
+		}
 		padded := make([]byte, roundUpFilename(2+len(nb)))
 		binary.LittleEndian.PutUint16(padded[0:2], uint16(len(nb)))
 		copy(padded[2:], nb)

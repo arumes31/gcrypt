@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/google/uuid"
@@ -142,7 +143,7 @@ type Config struct {
 
 // DefaultIgnorePatterns returns the default ignore patterns list.
 func DefaultIgnorePatterns() []string {
-	return []string{"~$*", "*.tmp", "*.swp", ".DS_Store", "Thumbs.db", "desktop.ini"}
+	return []string{"~$*", "*~", ".~lock.*#", "*.lock", "*.tmp", "*.swp", ".DS_Store", "Thumbs.db", "desktop.ini"}
 }
 
 // DefaultConfig returns a Config populated with sensible defaults.
@@ -640,6 +641,26 @@ func Save(path string, cfg *Config) error {
 // Validate
 // ---------------------------------------------------------------------------
 
+// validateHHMM validates a "HH:MM" 24-hour time string. An empty string is
+// rejected (a quiet-hours boundary must be specified once the feature is
+// enabled). This mirrors sync.ValidateScheduleTime, duplicated here because the
+// sync package imports config and cannot be imported back without a cycle.
+func validateHHMM(s string) error {
+	parts := strings.SplitN(s, ":", 2)
+	if len(parts) != 2 {
+		return fmt.Errorf("invalid time %q: expected HH:MM (24-hour)", s)
+	}
+	h, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+	if err != nil || h < 0 || h > 23 {
+		return fmt.Errorf("invalid time %q: expected HH:MM (24-hour)", s)
+	}
+	m, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err != nil || m < 0 || m > 59 {
+		return fmt.Errorf("invalid time %q: expected HH:MM (24-hour)", s)
+	}
+	return nil
+}
+
 // Validate checks that the configuration values are valid and returns an error
 // describing the first issue found.
 func (c *Config) Validate() error {
@@ -686,6 +707,15 @@ func (c *Config) Validate() error {
 
 	if c.App.LogMaxBackups < 0 {
 		return errors.New("app.log_max_backups must be >= 0")
+	}
+
+	if c.App.Schedule.QuietHoursEnabled {
+		if err := validateHHMM(c.App.Schedule.QuietHoursStart); err != nil {
+			return fmt.Errorf("app.schedule.quiet_hours_start: %w", err)
+		}
+		if err := validateHHMM(c.App.Schedule.QuietHoursEnd); err != nil {
+			return fmt.Errorf("app.schedule.quiet_hours_end: %w", err)
+		}
 	}
 
 	// Reject configs where sync pairs overlap/nest local directories or

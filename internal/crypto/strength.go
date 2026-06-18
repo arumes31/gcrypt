@@ -39,7 +39,7 @@ func CheckPassphraseStrength(passphrase string) error {
 	}
 
 	var hasLower, hasUpper, hasDigit, hasOther bool
-	first := rune(passphrase[0])
+	first := []rune(passphrase)[0]
 	allSame := true
 	for _, r := range passphrase {
 		if r != first {
