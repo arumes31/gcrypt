@@ -75,7 +75,11 @@ jobs:
           cache: true
 
       - name: Build
-        run: go build -o gcrypt.exe ./cmd/gcrypt/main.go
+        # Build the whole package, not just main.go — the package is split across
+        # several files (console/opengl/single-instance helpers) that main.go needs.
+        run: go build -o gcrypt.exe ./cmd/gcrypt
+        env:
+          CGO_ENABLED: "1"
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v7
