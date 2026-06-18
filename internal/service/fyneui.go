@@ -77,9 +77,28 @@ type FyneApp struct {
 	app fyne.App
 	win fyne.Window
 
-	mu       sync.Mutex
-	events   []syncpkg.ActivityEvent
-	isPaused bool
+	mu     sync.Mutex
+	events []syncpkg.ActivityEvent
+
+	// lastPaused mirrors the derived "all pairs paused" state so the tray menu
+	// and footer button are only rebuilt when it actually flips.
+	lastPaused    bool
+	lastPausedSet bool
+
+	// notifyState tracks the high-level state used for desktop notifications so
+	// we only fire one toast per real transition (not on every 2s refresh).
+	notifyState    appstate.State
+	notifyStateSet bool
+
+	// Activity-feed dedup: skip List.Refresh() when nothing changed (avoids
+	// fighting the user's scroll position and pointless redraws).
+	lastActivityCount int
+	lastActivityTop   time.Time
+
+	// Per-pair live widgets (Folders tab), keyed by pair ID. Rebuilt by
+	// refreshPairs and updated in place by the refresh loop so per-folder stats
+	// stay live without rebuilding the whole tab.
+	pairWidgets map[string]*pairWidgets
 
 	// Header widgets.
 	statusDot   *canvas.Circle
@@ -117,6 +136,9 @@ type FyneApp struct {
 	// Folders tab content (rebuilt on change).
 	pairsContainer *fyne.Container
 
+	// Issues tab content (rebuilt on demand): failed transfers + conflicts.
+	issuesContainer *fyne.Container
+
 	// Footer.
 	pauseBtn *widget.Button
 }
@@ -131,6 +153,7 @@ func NewFyneApp(ctrl *AppController, logger *Logger) *FyneApp {
 func (f *FyneApp) Run() {
 	f.app = app.NewWithID("com.arumes31.gcrypt")
 	f.app.SetIcon(resLogo)
+	f.app.Settings().SetTheme(brandTheme{})
 
 	f.win = f.app.NewWindow("gcrypt")
 	f.win.SetIcon(resLogo)
@@ -224,11 +247,15 @@ func (f *FyneApp) buildContent() fyne.CanvasObject {
 	tabs := container.NewAppTabs(
 		container.NewTabItemWithIcon("Activity", theme.HistoryIcon(), activityTab),
 		container.NewTabItemWithIcon("Folders", theme.FolderIcon(), foldersTab),
+		container.NewTabItemWithIcon("Issues", theme.WarningIcon(), f.buildIssuesTab()),
 		container.NewTabItemWithIcon("Settings", theme.SettingsIcon(), f.buildSettingsTab()),
 	)
 	tabs.OnSelected = func(ti *container.TabItem) {
-		if ti.Text == "Folders" {
+		switch ti.Text {
+		case "Folders":
 			f.refreshPairs()
+		case "Issues":
+			f.refreshIssues()
 		}
 	}
 
@@ -264,7 +291,7 @@ func (f *FyneApp) installTray() {
 // buildTrayMenu constructs the (small, Nextcloud-style) tray menu.
 func (f *FyneApp) buildTrayMenu() *fyne.Menu {
 	pauseLabel := "Pause All"
-	if f.isPaused {
+	if f.syncPaused() {
 		pauseLabel = "Resume All"
 	}
 	return fyne.NewMenu("gcrypt",
@@ -400,6 +427,14 @@ func (f *FyneApp) refresh() {
 		}
 	}
 
+	// Keep the Pause/Resume controls in step with the real per-pair state
+	// (a folder may have been paused/resumed from its own card).
+	f.refreshPauseControls()
+
+	// Desktop notifications on meaningful transitions (entered error, came back
+	// up to date, sign-in required). Fired once per real change.
+	f.maybeNotify(state)
+
 	// Summary line + activity feed (only meaningful once syncing).
 	f.refreshSummary(state)
 	f.refreshActivity()
@@ -427,6 +462,60 @@ func (f *FyneApp) setCTA(label string, fn func()) {
 	f.cta.SetText(label)
 	f.cta.OnTapped = fn
 	f.cta.Show()
+}
+
+// maybeNotify fires a desktop notification when the high-level state changes in
+// a way worth surfacing while the window is hidden/unfocused. It only acts on a
+// genuine transition (prev → state), so the 2s refresh loop won't spam toasts.
+func (f *FyneApp) maybeNotify(state appstate.State) {
+	prev := f.notifyState
+	had := f.notifyStateSet
+	f.notifyState = state
+	f.notifyStateSet = true
+
+	// Don't announce the very first observed state at startup.
+	if !had || prev == state {
+		return
+	}
+
+	switch state {
+	case appstate.Error:
+		msg := "A sync error occurred. Open gcrypt to see details."
+		if le := f.lastSyncError(); le != "" {
+			msg = le
+		}
+		f.notify("gcrypt — Sync error", msg)
+	case appstate.NeedsOAuth:
+		f.notify("gcrypt — Sign in required", "Reconnect your Google account to keep syncing.")
+	case appstate.Idle:
+		// Only celebrate reaching "up to date" after actual sync activity.
+		switch prev {
+		case appstate.Connecting, appstate.Scanning, appstate.Syncing:
+			f.notify("gcrypt — Up to date", "All files are in sync.")
+		}
+	}
+}
+
+// notify sends a desktop notification, guarding against a nil app.
+func (f *FyneApp) notify(title, content string) {
+	if f.app == nil {
+		return
+	}
+	f.app.SendNotification(fyne.NewNotification(title, content))
+}
+
+// lastSyncError returns the most recent per-pair error message, if any.
+func (f *FyneApp) lastSyncError() string {
+	manager := f.ctrl.Manager()
+	if manager == nil {
+		return ""
+	}
+	for _, ps := range manager.GetAggregatedState().PairStatuses {
+		if ps.Stats.LastError != "" {
+			return ps.Stats.LastError
+		}
+	}
+	return ""
 }
 
 // refreshSummary updates the folder line, cumulative counters + live transfer
@@ -464,6 +553,9 @@ func (f *FyneApp) refreshSummary(state appstate.State) {
 		active += ps.Activity.Active
 		current = append(current, ps.Activity.Current...)
 	}
+
+	// Update any live per-folder widgets on the Folders tab.
+	f.updatePairWidgets(agg)
 
 	// Compute a smoothed transfer rate from byte deltas since the last refresh.
 	f.updateRates(bytesUp, bytesDown)
@@ -554,7 +646,8 @@ func (f *FyneApp) updateRates(bytesUp, bytesDown int64) {
 	f.lastRateTime = now
 }
 
-// humanBytes formats a byte count as B/KB/MB/GB.
+// humanBytes formats a byte count using binary (1024-based) IEC units, so the
+// labels (KiB/MiB/GiB/TiB) match the divisor actually used.
 func humanBytes(n int64) string {
 	const unit = 1024
 	if n < unit {
@@ -565,16 +658,16 @@ func humanBytes(n int64) string {
 		div *= unit
 		exp++
 	}
-	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGT"[exp])
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGT"[exp])
 }
 
-// humanRate formats a bytes/sec rate as KB/s, MB/s, etc.
+// humanRate formats a bytes/sec rate using binary IEC units (KiB/s, MiB/s).
 func humanRate(bps float64) string {
 	switch {
 	case bps >= 1024*1024:
-		return fmt.Sprintf("%.1f MB/s", bps/(1024*1024))
+		return fmt.Sprintf("%.1f MiB/s", bps/(1024*1024))
 	case bps >= 1024:
-		return fmt.Sprintf("%.0f KB/s", bps/1024)
+		return fmt.Sprintf("%.0f KiB/s", bps/1024)
 	default:
 		return fmt.Sprintf("%.0f B/s", bps)
 	}
@@ -599,11 +692,11 @@ func (f *FyneApp) togglePauseAll() {
 	if manager == nil {
 		return
 	}
-	f.mu.Lock()
-	pause := !f.isPaused
-	f.isPaused = pause
-	f.mu.Unlock()
 
+	// Derive the action from the real per-pair state rather than a local flag:
+	// if everything is already paused, resume; otherwise (including a mixed
+	// state where the user paused some folders by hand) pause all.
+	pause := !f.syncPaused()
 	for _, ps := range manager.ListPairs() {
 		if pause {
 			_ = manager.PausePair(ps.ID)
@@ -612,15 +705,51 @@ func (f *FyneApp) togglePauseAll() {
 		}
 	}
 	fyne.Do(func() {
-		if pause {
+		f.refreshPauseControls()
+		f.refreshPairs()
+	})
+}
+
+// syncPaused reports whether there is at least one managed pair and every pair
+// is currently paused. It is the single source of truth for the Pause/Resume
+// label in both the footer and the tray menu.
+func (f *FyneApp) syncPaused() bool {
+	manager := f.ctrl.Manager()
+	if manager == nil {
+		return false
+	}
+	pairs := manager.ListPairs()
+	if len(pairs) == 0 {
+		return false
+	}
+	for _, ps := range pairs {
+		if ps.State != syncpkg.StatePaused {
+			return false
+		}
+	}
+	return true
+}
+
+// refreshPauseControls syncs the footer Pause/Resume button and (only when the
+// derived state flips) the tray menu with the actual per-pair pause state.
+func (f *FyneApp) refreshPauseControls() {
+	paused := f.syncPaused()
+	if f.lastPausedSet && f.lastPaused == paused {
+		return // no change — avoid pointless widget/tray-menu refreshes
+	}
+	f.lastPaused = paused
+	f.lastPausedSet = true
+
+	if f.pauseBtn != nil {
+		if paused {
 			f.pauseBtn.SetText("Resume All")
 			f.pauseBtn.SetIcon(theme.MediaPlayIcon())
 		} else {
 			f.pauseBtn.SetText("Pause All")
 			f.pauseBtn.SetIcon(theme.MediaPauseIcon())
 		}
-		f.refreshTrayMenu()
-	})
+	}
+	f.refreshTrayMenu()
 }
 
 func (f *FyneApp) openSyncFolder() {

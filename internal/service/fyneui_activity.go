@@ -77,6 +77,19 @@ func (f *FyneApp) refreshActivity() {
 	} else {
 		f.emptyHint.Hide()
 	}
+
+	// Only repaint when the feed actually changed (count or newest timestamp).
+	// Refreshing unconditionally every 2s fights the user's scroll position and
+	// wastes redraws.
+	var top time.Time
+	if n > 0 {
+		top = events[0].Time
+	}
+	if n == f.lastActivityCount && top.Equal(f.lastActivityTop) {
+		return
+	}
+	f.lastActivityCount = n
+	f.lastActivityTop = top
 	f.activityList.Refresh()
 }
 

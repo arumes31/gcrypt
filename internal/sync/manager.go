@@ -186,6 +186,19 @@ func (m *SyncManager) StopAll() {
 func (m *SyncManager) AddPair(pair *config.SyncPair) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// Reject a pair that overlaps an already-running one (nested/identical local
+	// folder or the same Drive folder) — that causes double-syncing and delete
+	// races.
+	if pair != nil {
+		for _, eng := range m.engines {
+			if eng.pair.ID == pair.ID {
+				continue
+			}
+			if config.PairsOverlap(pair, eng.pair) {
+				return fmt.Errorf("syncmanager: sync folder %q overlaps existing pair %q", pair.LocalDir, eng.pair.LocalDir)
+			}
+		}
+	}
 	// Start asynchronously: engine.Start() runs the full initial scan+enqueue
 	// inline, which would hold m.mu (and, via the caller, the tray lock) for the
 	// whole scan and freeze the UI. StartAsync returns immediately and scans in
@@ -369,6 +382,85 @@ func (m *SyncManager) RecentActivity(limit int) []ActivityEvent {
 		merged = merged[:limit]
 	}
 	return merged
+}
+
+// ListErrored returns the errored files across all managed pairs, for the GUI
+// Issues view.
+func (m *SyncManager) ListErrored() []ErroredFile {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var out []ErroredFile
+	for _, engine := range m.engines {
+		out = append(out, engine.ListErrored()...)
+	}
+	return out
+}
+
+// RetryFailed re-enqueues all errored files across every pair for another
+// attempt and returns the total number of operations re-enqueued. The engines
+// are snapshotted under the lock and retried without it held, since RetryFailed
+// can block on queue backpressure.
+func (m *SyncManager) RetryFailed() int {
+	m.mu.RLock()
+	engines := make([]*Engine, 0, len(m.engines))
+	for _, engine := range m.engines {
+		engines = append(engines, engine)
+	}
+	m.mu.RUnlock()
+
+	n := 0
+	for _, engine := range engines {
+		n += engine.RetryFailed()
+	}
+	return n
+}
+
+// PendingConflicts returns all manually-queued conflicts across every pair.
+func (m *SyncManager) PendingConflicts() []ConflictItem {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var out []ConflictItem
+	for _, engine := range m.engines {
+		out = append(out, engine.PendingConflicts()...)
+	}
+	return out
+}
+
+// ResolveConflict resolves a manual conflict on the correct engine.
+func (m *SyncManager) ResolveConflict(pairID, localPath string, action config.ConflictPolicy) error {
+	m.mu.RLock()
+	engine, exists := m.engines[pairID]
+	m.mu.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("syncmanager: no engine for pair %s", pairID)
+	}
+	return engine.ResolveConflictAction(localPath, action)
+}
+
+// OnlineOnlyCount returns the number of online-only placeholder files for a pair.
+func (m *SyncManager) OnlineOnlyCount(pairID string) int {
+	m.mu.RLock()
+	engine, ok := m.engines[pairID]
+	m.mu.RUnlock()
+	if !ok {
+		return 0
+	}
+	return engine.OnlineOnlyCount()
+}
+
+// MakeAvailableOffline downloads all online-only placeholders for a pair,
+// returning the number queued.
+func (m *SyncManager) MakeAvailableOffline(pairID string) int {
+	m.mu.RLock()
+	engine, ok := m.engines[pairID]
+	m.mu.RUnlock()
+	if !ok {
+		return 0
+	}
+	return engine.MakeAvailableOffline()
 }
 
 // StateChanges returns a channel that emits aggregated state changes.

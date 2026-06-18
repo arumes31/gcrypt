@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -199,6 +200,91 @@ func (s *Scanner) ScanStream(ctx context.Context, out chan<- *models.SyncFile) e
 	})
 
 	return g.Wait()
+}
+
+// inSelectedFolder reports whether the slash-relative path falls within the
+// configured selected folders. With none configured, everything is in scope.
+func (s *Scanner) inSelectedFolder(rel string) bool {
+	if len(s.selectedFolders) == 0 {
+		return true
+	}
+	for _, folder := range s.selectedFolders {
+		nf := filepath.ToSlash(filepath.Clean(folder))
+		if nf == "." {
+			nf = ""
+		}
+		if nf == "" || rel == nf || strings.HasPrefix(rel, nf+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// EmptyDirs returns the relative, slash-separated paths of directories under the
+// sync root that contain no non-ignored regular files anywhere in their subtree.
+// Such directories would otherwise never be represented remotely, because remote
+// folders are normally created only as a side effect of uploading a file. It
+// honours the same ignore and selected-folder rules as ScanStream.
+func (s *Scanner) EmptyDirs() ([]string, error) {
+	dirs := make(map[string]struct{})
+	withFile := make(map[string]struct{})
+
+	walkErr := filepath.WalkDir(s.dir, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			if os.IsPermission(err) {
+				if d != nil && d.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			return err
+		}
+		if p == s.dir {
+			return nil
+		}
+		if s.ignore.Match(p) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		rel, rerr := filepath.Rel(s.dir, p)
+		if rerr != nil {
+			return nil
+		}
+		rel = filepath.ToSlash(rel)
+
+		if !s.inSelectedFolder(rel) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		if d.IsDir() {
+			dirs[rel] = struct{}{}
+			return nil
+		}
+		if info, ierr := d.Info(); ierr != nil || !info.Mode().IsRegular() {
+			return nil
+		}
+		// Mark every ancestor directory as containing a file.
+		for a := path.Dir(rel); a != "." && a != "/" && a != ""; a = path.Dir(a) {
+			withFile[a] = struct{}{}
+		}
+		return nil
+	})
+	if walkErr != nil {
+		return nil, walkErr
+	}
+
+	var empty []string
+	for dir := range dirs {
+		if _, has := withFile[dir]; !has {
+			empty = append(empty, dir)
+		}
+	}
+	return empty, nil
 }
 
 // ScanSingle scans a single file and returns its SyncFile record.

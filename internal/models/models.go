@@ -13,6 +13,9 @@ const (
 	SyncStatusSynced     SyncStatus = "synced"
 	SyncStatusConflict   SyncStatus = "conflict"
 	SyncStatusError      SyncStatus = "error"
+	// SyncStatusOnlineOnly marks a remote file that is tracked but intentionally
+	// not downloaded (on-demand / online-only). It has no local content.
+	SyncStatusOnlineOnly SyncStatus = "online_only"
 )
 
 // ChangeOp represents the type of file system change event.

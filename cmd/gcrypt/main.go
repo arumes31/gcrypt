@@ -123,6 +123,15 @@ func main() {
 		return
 	}
 
+	// Enforce a single running instance per Windows session. Done after the
+	// OpenGL relaunch handoff so the relaunching parent doesn't hold the guard
+	// against its own child. A second launch simply exits (the first instance
+	// keeps running in the tray).
+	if !acquireSingleInstance() {
+		logger.Info("another gcrypt instance is already running; exiting this one")
+		return
+	}
+
 	// 3. Create AppController (determines initial state from config).
 	ctrl := service.NewAppController(cfg, logger)
 
