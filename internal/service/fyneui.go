@@ -353,6 +353,12 @@ func (f *FyneApp) accountLoop() {
 func (f *FyneApp) refreshAccountInfo() {
 	client := f.ctrl.DriveClient()
 	if client == nil {
+		// No Drive client means auth genuinely hasn't happened yet.
+		fyne.Do(func() {
+			if f.accountLabel != nil {
+				f.accountLabel.SetText("Not signed in")
+			}
+		})
 		return
 	}
 
@@ -360,9 +366,18 @@ func (f *FyneApp) refreshAccountInfo() {
 	defer cancel()
 	info, err := client.About(ctx)
 	if err != nil {
+		// A Drive client exists, so we ARE signed in — uploads/downloads work on
+		// the drive.file scope. The "about" resource (email + storage quota) may
+		// be unavailable or fail under that minimal scope, so don't mislabel this
+		// as "Not signed in"; just show signed-in without the extra details.
 		if f.logger != nil {
 			f.logger.Warn("failed to fetch Drive account info", map[string]interface{}{"error": err.Error()})
 		}
+		fyne.Do(func() {
+			if f.accountLabel != nil {
+				f.accountLabel.SetText("Signed in")
+			}
+		})
 		return
 	}
 
