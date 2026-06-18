@@ -1,0 +1,16 @@
+# gcrypt builds on Windows and its CI lints on a Windows runner. gofmt requires
+# LF line endings, but Git's autocrlf would otherwise check files out as CRLF on
+# Windows, making every file fail the gofmt check. Force LF for source and text
+# config files so checkouts are consistent on every platform.
+*.go    text eol=lf
+go.mod  text eol=lf
+go.sum  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+
+# Binary assets must never be line-ending normalised.
+*.png   binary
+*.ico   binary
+*.icns  binary
