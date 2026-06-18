@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/google/uuid"
@@ -52,16 +53,41 @@ type v1Config struct {
 // V2 Config types
 // ---------------------------------------------------------------------------
 
+// SyncDirection controls the data-flow policy for a sync pair.
+type SyncDirection string
+
+const (
+	SyncDirTwoWay       SyncDirection = "two_way"       // full bidirectional (default)
+	SyncDirUploadOnly   SyncDirection = "upload_only"    // local → remote only
+	SyncDirDownloadOnly SyncDirection = "download_only"  // remote → local only
+	SyncDirMirror       SyncDirection = "mirror"         // local → remote, no remote deletes
+)
+
+// ConflictPolicy determines how a sync conflict is resolved.
+type ConflictPolicy string
+
+const (
+	ConflictPolicyAuto       ConflictPolicy = "auto"        // last-write-wins (default)
+	ConflictPolicyKeepLocal  ConflictPolicy = "keep_local"  // always push local
+	ConflictPolicyKeepRemote ConflictPolicy = "keep_remote" // always pull remote
+	ConflictPolicyKeepBoth   ConflictPolicy = "keep_both"   // keep both, rename conflict
+	ConflictPolicyManual     ConflictPolicy = "manual"      // queue for manual resolution in UI
+)
+
 // SyncPair represents one local↔remote sync relationship.
 type SyncPair struct {
-	ID              string   `yaml:"id"`
-	LocalDir        string   `yaml:"local_dir"`
-	DriveFolderID   string   `yaml:"drive_folder_id"`
-	Enabled         bool     `yaml:"enabled"`
-	IgnorePatterns  []string `yaml:"ignore_patterns"`
-	SyncInterval    int      `yaml:"sync_interval"`
-	SelectedFolders []string `yaml:"selected_folders"`
-	ForwardOnly     bool     `yaml:"forward_only"`
+	ID              string         `yaml:"id"`
+	LocalDir        string         `yaml:"local_dir"`
+	DriveFolderID   string         `yaml:"drive_folder_id"`
+	Enabled         bool           `yaml:"enabled"`
+	IgnorePatterns  []string       `yaml:"ignore_patterns"`
+	SyncInterval    int            `yaml:"sync_interval"`
+	SelectedFolders []string       `yaml:"selected_folders"`
+	ForwardOnly     bool           `yaml:"forward_only"`      // DEPRECATED: migrated to SyncDirection
+	SyncDirection   SyncDirection  `yaml:"sync_direction"`    // data-flow policy
+	ConflictPolicy  ConflictPolicy `yaml:"conflict_policy"`   // conflict resolution strategy
+	OnlineOnly      bool           `yaml:"online_only"`       // create placeholders instead of downloading
+	PadFilenames    bool           `yaml:"pad_filenames"`     // pad encrypted names to hide length (set before first sync)
 }
 
 // EncryptionConfig holds encryption-related settings.
@@ -79,18 +105,27 @@ type OAuthConfig struct {
 	ClientSecretEnc string `yaml:"client_secret_enc"`
 }
 
+// ScheduleConfig holds sync scheduling settings.
+type ScheduleConfig struct {
+	QuietHoursEnabled bool   `yaml:"quiet_hours_enabled"`
+	QuietHoursStart   string `yaml:"quiet_hours_start"` // "HH:MM" 24-hour format
+	QuietHoursEnd     string `yaml:"quiet_hours_end"`   // "HH:MM" 24-hour format
+	PauseOnMetered    bool   `yaml:"pause_on_metered"`  // auto-pause on metered network
+}
+
 // AppConfig holds application-level settings.
 type AppConfig struct {
-	AutoStart          bool   `yaml:"auto_start"`
-	RememberPassphrase bool   `yaml:"remember_passphrase"`
-	LogLevel           string `yaml:"log_level"`
-	LogPath            string `yaml:"log_path"`
-	LogMaxSize         int    `yaml:"log_max_size"`
-	LogMaxBackups      int    `yaml:"log_max_backups"`
-	MaxFileSize        int64  `yaml:"max_file_size"`
-	RateLimitUpKBps    int    `yaml:"rate_limit_up_kbps"`   // 0 = unlimited
-	RateLimitDownKBps  int    `yaml:"rate_limit_down_kbps"` // 0 = unlimited
-	UploadWorkers      int    `yaml:"upload_workers"`       // 0 = use default; concurrent uploads per pair
+	AutoStart          bool           `yaml:"auto_start"`
+	RememberPassphrase bool           `yaml:"remember_passphrase"`
+	LogLevel           string         `yaml:"log_level"`
+	LogPath            string         `yaml:"log_path"`
+	LogMaxSize         int            `yaml:"log_max_size"`
+	LogMaxBackups      int            `yaml:"log_max_backups"`
+	MaxFileSize        int64          `yaml:"max_file_size"`
+	RateLimitUpKBps    int            `yaml:"rate_limit_up_kbps"`   // 0 = unlimited
+	RateLimitDownKBps  int            `yaml:"rate_limit_down_kbps"` // 0 = unlimited
+	UploadWorkers      int            `yaml:"upload_workers"`       // 0 = use default; concurrent uploads per pair
+	Schedule           ScheduleConfig `yaml:"schedule"`
 }
 
 // Config is the top-level V2 configuration.
@@ -108,7 +143,7 @@ type Config struct {
 
 // DefaultIgnorePatterns returns the default ignore patterns list.
 func DefaultIgnorePatterns() []string {
-	return []string{"~$*", "*.tmp", "*.swp", ".DS_Store", "Thumbs.db", "desktop.ini"}
+	return []string{"~$*", "*~", ".~lock.*#", "*.lock", "*.tmp", "*.swp", ".DS_Store", "Thumbs.db", "desktop.ini"}
 }
 
 // DefaultConfig returns a Config populated with sensible defaults.
@@ -165,6 +200,77 @@ func (c *Config) RemoveSyncPair(id string) bool {
 	return false
 }
 
+// normDir returns a cleaned, absolute, case-folded form of a local directory
+// for overlap comparison. Case folding matches Windows' case-insensitive
+// filesystem; it is harmless on case-sensitive systems for this purpose.
+func normDir(p string) string {
+	if p == "" {
+		return ""
+	}
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		abs = p
+	}
+	return strings.ToLower(filepath.Clean(abs))
+}
+
+// localDirsOverlap reports whether two local directories are equal or one nests
+// inside the other (which would cause double-syncing and delete races).
+func localDirsOverlap(a, b string) bool {
+	na, nb := normDir(a), normDir(b)
+	if na == "" || nb == "" {
+		return false
+	}
+	if na == nb {
+		return true
+	}
+	sep := string(filepath.Separator)
+	return strings.HasPrefix(na, nb+sep) || strings.HasPrefix(nb, na+sep)
+}
+
+// PairsOverlap reports whether two pairs clash: their local directories are
+// equal/nested, or they target the same Drive folder.
+func PairsOverlap(a, b *SyncPair) bool {
+	if localDirsOverlap(a.LocalDir, b.LocalDir) {
+		return true
+	}
+	return a.DriveFolderID != "" && a.DriveFolderID == b.DriveFolderID
+}
+
+// CanAddPair reports whether a new pair with the given local directory and Drive
+// folder can be added without overlapping (equalling or nesting) an existing
+// pair's local directory or reusing its Drive folder. It returns a descriptive
+// error when there is a clash, or nil when the pair is safe to add.
+func (c *Config) CanAddPair(localDir, driveFolderID string) error {
+	for i := range c.SyncPairs {
+		p := &c.SyncPairs[i]
+		if localDirsOverlap(localDir, p.LocalDir) {
+			return fmt.Errorf("local folder %q overlaps an existing sync folder %q", localDir, p.LocalDir)
+		}
+		if driveFolderID != "" && driveFolderID == p.DriveFolderID {
+			return fmt.Errorf("Drive folder %q is already used by another sync pair", driveFolderID)
+		}
+	}
+	return nil
+}
+
+// ValidateNoOverlap checks that no two configured pairs share/nest local
+// directories or target the same Drive folder, returning the first clash found.
+func (c *Config) ValidateNoOverlap() error {
+	for i := 0; i < len(c.SyncPairs); i++ {
+		for j := i + 1; j < len(c.SyncPairs); j++ {
+			a, b := &c.SyncPairs[i], &c.SyncPairs[j]
+			if localDirsOverlap(a.LocalDir, b.LocalDir) {
+				return fmt.Errorf("sync folders overlap: %q and %q (one contains the other)", a.LocalDir, b.LocalDir)
+			}
+			if a.DriveFolderID != "" && a.DriveFolderID == b.DriveFolderID {
+				return fmt.Errorf("two sync pairs target the same Drive folder %q", a.DriveFolderID)
+			}
+		}
+	}
+	return nil
+}
+
 // GetSyncPair returns a sync pair by ID, or nil.
 func (c *Config) GetSyncPair(id string) *SyncPair {
 	for i := range c.SyncPairs {
@@ -193,6 +299,28 @@ func (p *SyncPair) EffectiveIgnorePatterns() []string {
 		return p.IgnorePatterns
 	}
 	return DefaultIgnorePatterns()
+}
+
+// EffectiveDirection returns the pair's sync direction, defaulting to two-way.
+// It honours the legacy ForwardOnly flag (upload-only) when SyncDirection is
+// unset so existing configs keep their behaviour.
+func (p *SyncPair) EffectiveDirection() SyncDirection {
+	if p.SyncDirection != "" {
+		return p.SyncDirection
+	}
+	if p.ForwardOnly {
+		return SyncDirUploadOnly
+	}
+	return SyncDirTwoWay
+}
+
+// EffectiveConflictPolicy returns the pair's conflict policy, defaulting to
+// auto (last-write-wins).
+func (p *SyncPair) EffectiveConflictPolicy() ConflictPolicy {
+	if p.ConflictPolicy != "" {
+		return p.ConflictPolicy
+	}
+	return ConflictPolicyAuto
 }
 
 // ---------------------------------------------------------------------------
@@ -457,9 +585,22 @@ func applyDefaults(cfg *Config) {
 	}
 
 	// Apply SyncPair-level defaults.
-	for range cfg.SyncPairs {
-		// Enabled is false by default in Go; the AddSyncPair method always
-		// sets Enabled=true explicitly. We respect the deserialized value.
+	for i := range cfg.SyncPairs {
+		p := &cfg.SyncPairs[i]
+
+		// Migrate deprecated ForwardOnly → SyncDirection.
+		if p.ForwardOnly && p.SyncDirection == "" {
+			p.SyncDirection = SyncDirUploadOnly
+			p.ForwardOnly = false
+		}
+		// Default sync direction.
+		if p.SyncDirection == "" {
+			p.SyncDirection = SyncDirTwoWay
+		}
+		// Default conflict policy.
+		if p.ConflictPolicy == "" {
+			p.ConflictPolicy = ConflictPolicyAuto
+		}
 	}
 }
 
@@ -500,6 +641,26 @@ func Save(path string, cfg *Config) error {
 // Validate
 // ---------------------------------------------------------------------------
 
+// validateHHMM validates a "HH:MM" 24-hour time string. An empty string is
+// rejected (a quiet-hours boundary must be specified once the feature is
+// enabled). This mirrors sync.ValidateScheduleTime, duplicated here because the
+// sync package imports config and cannot be imported back without a cycle.
+func validateHHMM(s string) error {
+	parts := strings.SplitN(s, ":", 2)
+	if len(parts) != 2 {
+		return fmt.Errorf("invalid time %q: expected HH:MM (24-hour)", s)
+	}
+	h, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+	if err != nil || h < 0 || h > 23 {
+		return fmt.Errorf("invalid time %q: expected HH:MM (24-hour)", s)
+	}
+	m, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err != nil || m < 0 || m > 59 {
+		return fmt.Errorf("invalid time %q: expected HH:MM (24-hour)", s)
+	}
+	return nil
+}
+
 // Validate checks that the configuration values are valid and returns an error
 // describing the first issue found.
 func (c *Config) Validate() error {
@@ -526,6 +687,10 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	if err := c.ValidateNoOverlap(); err != nil {
+		return err
+	}
+
 	if c.Encryption.PassphraseHash == "" {
 		return errors.New("encryption.passphrase_hash is required; run setup to configure")
 	}
@@ -542,6 +707,21 @@ func (c *Config) Validate() error {
 
 	if c.App.LogMaxBackups < 0 {
 		return errors.New("app.log_max_backups must be >= 0")
+	}
+
+	if c.App.Schedule.QuietHoursEnabled {
+		if err := validateHHMM(c.App.Schedule.QuietHoursStart); err != nil {
+			return fmt.Errorf("app.schedule.quiet_hours_start: %w", err)
+		}
+		if err := validateHHMM(c.App.Schedule.QuietHoursEnd); err != nil {
+			return fmt.Errorf("app.schedule.quiet_hours_end: %w", err)
+		}
+	}
+
+	// Reject configs where sync pairs overlap/nest local directories or
+	// target the same Drive folder (e.g. from a hand-edited YAML).
+	if err := c.ValidateNoOverlap(); err != nil {
+		return err
 	}
 
 	return nil

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"golang.org/x/sync/singleflight"
+	"golang.org/x/text/unicode/norm"
 
 	"github.com/arumes31/gcrypt/internal/appstate"
 	"github.com/arumes31/gcrypt/internal/config"
@@ -79,9 +80,10 @@ type SyncStats struct {
 // SyncActivity is a point-in-time snapshot of in-flight and queued work,
 // used to drive the tray's live activity display.
 type SyncActivity struct {
-	Pending int      // operations waiting in the work queue
-	Active  int      // operations currently being processed
-	Current []string // short descriptions of the in-flight operations (e.g. "↑ report.pdf")
+	Pending      int      // operations waiting in the work queue
+	PendingBytes int64    // total bytes of queued + in-flight transfer ops (uploads/downloads)
+	Active       int      // operations currently being processed
+	Current      []string // short descriptions of the in-flight operations (e.g. "↑ report.pdf")
 }
 
 // ActivityKind classifies a completed sync event for the activity feed.
@@ -142,6 +144,13 @@ type Engine struct {
 	// Accessed atomically.
 	pendingOps int64
 
+	// pendingBytes mirrors pendingOps but sums the byte size of outstanding
+	// transfer operations (uploads/downloads), so the UI can show byte-based
+	// progress and an ETA rather than a file-count ratio that jumps when a large
+	// file follows many tiny ones. Accessed atomically; incremented/decremented
+	// in lock-step with pendingOps.
+	pendingBytes int64
+
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -153,6 +162,10 @@ type Engine struct {
 	maxRetries  int
 	workers     int
 	rateLimiter *time.Ticker
+	// largeUploadSem bounds concurrent large-file uploads (each buffers up to one
+	// upload chunk) so a high worker count stays memory-safe. Buffered to
+	// maxConcurrentLargeUploads; small files don't acquire it.
+	largeUploadSem chan struct{}
 
 	// folderCache maps a slash-separated plaintext relative directory to its
 	// Drive folder ID, for the hierarchical layout. Guarded by folderMu. The
@@ -167,6 +180,12 @@ type Engine struct {
 	// syncNowCh is used by SyncNow() to trigger an immediate full scan.
 	syncNowCh chan struct{}
 
+	// changePageToken holds the Drive changes-feed cursor between remote polls.
+	// Empty means "no baseline yet": the next poll establishes one and does a
+	// full reconcile. It is only ever read/written from the pollRemoteChanges
+	// goroutine (the sole caller of pollOnce), so it needs no lock.
+	changePageToken string
+
 	// OnError is a channel that receives errors from background operations
 	// (e.g. async scan failures). The tray or controller can listen on this
 	// channel to be notified of asynchronous errors without polling.
@@ -177,6 +196,9 @@ type Engine struct {
 	// react to lifecycle transitions (Scanning → Syncing → Idle, etc.)
 	// without watching the SyncState channel.
 	OnStateChange func(oldState, newState appstate.State)
+
+	// conflicts holds unresolved conflicts queued for manual resolution.
+	conflicts conflictQueue
 }
 
 // EngineOption is a functional option for configuring an Engine.
@@ -188,15 +210,43 @@ func WithMaxRetries(n int) EngineOption {
 	return func(e *Engine) { e.maxRetries = n }
 }
 
-// defaultWorkers is the number of concurrent upload/download worker goroutines
-// per engine when not overridden by app.upload_workers. Uploads run in parallel
-// (the Drive client is concurrency-safe), so this directly drives throughput for
-// large numbers of small files.
-const defaultWorkers = 8
+// defaultWorkers is the worker-pool size per engine when not overridden by
+// app.upload_workers. Small-file throughput is bound by per-request latency
+// (~1s per small upload against Drive), so throughput ≈ workers ÷ latency and
+// concurrency is the main lever: to actually approach the request-rate cap you
+// need roughly maxRequestsPerSec workers in flight. The pool is load-adaptive by
+// nature — idle workers just block on the (empty) queue costing ~nothing, so
+// only as many as there is work run concurrently (it scales from ~0 up to this
+// many), which is why a high default is safe for light workloads. Large files
+// are separately capped (see maxConcurrentLargeUploads) so a high count stays
+// memory-safe; small files only buffer their own (small) size.
+const defaultWorkers = 160
 
-// maxRequestsPerSec caps the per-engine Drive request rate so a high worker
-// count can't hammer the API past its per-user limits.
-const maxRequestsPerSec = 100
+// maxRequestsPerSec caps the per-engine Drive request rate. Google's per-user
+// limit is ~200 requests/s (12,000/min); we aim for ~90% of that so a saturated
+// worker pool uses nearly the full budget while leaving headroom for bursts and
+// for the metadata/listing calls, with 429 retry+backoff as the backstop. NOTE:
+// this cap is per engine (per sync pair). With multiple pairs the combined rate
+// can exceed Google's per-user limit, so lower app.upload_workers when running
+// many pairs (429s are retried regardless).
+const maxRequestsPerSec = 180
+
+// largeUploadThreshold is the file size at or above which an upload buffers a
+// full upload chunk in memory. Concurrent uploads of such files are gated by
+// maxConcurrentLargeUploads so a high worker count can't blow up memory; smaller
+// files buffer only their own size and run with full worker concurrency.
+const largeUploadThreshold = 8 * 1024 * 1024 // 8 MiB (matches drive uploadChunkSize)
+
+// maxConcurrentLargeUploads bounds how many large-file uploads run at once,
+// independent of the worker count, capping large-upload memory at roughly
+// maxConcurrentLargeUploads * 8 MiB and keeping a handful of big files from
+// monopolising bandwidth.
+const maxConcurrentLargeUploads = 3
+
+// largeRequeueDelay is how long a worker waits before re-queuing a large upload
+// that couldn't get a large-upload slot, so it doesn't spin while big files are
+// saturated.
+const largeRequeueDelay = 250 * time.Millisecond
 
 // WithWorkers sets the number of concurrent worker goroutines, overriding the
 // default. Note: the request-rate limiter is sized from the worker count at
@@ -269,9 +319,10 @@ func NewEngine(pair *config.SyncPair, appCfg *config.AppConfig, driveClient *dri
 		stateChangeCh: make(chan SyncState, 64),
 		syncNowCh:     make(chan struct{}, 1),
 		OnError:       make(chan error, 64),
-		maxRetries:    5,
-		workers:       workers,
-		rateLimiter:   time.NewTicker(time.Second / time.Duration(reqPerSec)),
+		maxRetries:     5,
+		workers:        workers,
+		rateLimiter:    time.NewTicker(time.Second / time.Duration(reqPerSec)),
+		largeUploadSem: make(chan struct{}, maxConcurrentLargeUploads),
 	}
 
 	// Apply functional options.
@@ -279,7 +330,26 @@ func NewEngine(pair *config.SyncPair, appCfg *config.AppConfig, driveClient *dri
 		opt(e)
 	}
 
+	// Warm the scanner's hash cache from the previous run so a cold start doesn't
+	// re-hash the whole tree. Best-effort: a missing/old cache just means a
+	// regular (re-hashing) first scan.
+	if p := e.hashCachePath(); p != "" {
+		_ = e.scanner.LoadHashCache(p)
+	}
+
 	return e, nil
+}
+
+// hashCachePath returns the on-disk location of this pair's persistent hash
+// cache. It lives alongside the log file (the gcrypt app-data dir), keyed by
+// pair ID, so it is never placed inside the synced tree. Returns "" if no base
+// directory can be determined.
+func (e *Engine) hashCachePath() string {
+	base := filepath.Dir(e.appCfg.LogPath)
+	if base == "" || base == "." {
+		return ""
+	}
+	return filepath.Join(base, "hashcache-"+e.pair.ID+".json")
 }
 
 // ---------------------------------------------------------------------------
@@ -289,6 +359,16 @@ func NewEngine(pair *config.SyncPair, appCfg *config.AppConfig, driveClient *dri
 // ID returns the unique identifier of the sync pair this engine manages.
 func (e *Engine) ID() string {
 	return e.pair.ID
+}
+
+// encName encrypts a plaintext path component to its remote (Drive) name, using
+// the padded format when the pair has filename padding enabled. Decryption
+// auto-detects the format, so a pair can hold a mix of padded and unpadded names.
+func (e *Engine) encName(name string) (string, error) {
+	if e.pair.PadFilenames {
+		return crypto.EncryptFilenamePadded(name, e.masterKey)
+	}
+	return crypto.EncryptFilename(name, e.masterKey)
 }
 
 // SyncNow triggers an immediate full scan cycle, similar to what the remote
@@ -477,9 +557,16 @@ func (e *Engine) scanAndEnqueue() error {
 		scanErrCh <- err
 	}()
 
+	// In download-only mode the local tree never pushes upward, so skip upload
+	// and remote-delete generation entirely (but still drain the scan).
+	canUpload := e.allowsUpload()
+
 	seen := make(map[string]struct{}, len(previousFiles))
 	for sf := range fileCh {
 		seen[sf.LocalPath] = struct{}{}
+		if !canUpload {
+			continue
+		}
 		prev, existed := prevMap[sf.LocalPath]
 		if !existed {
 			// New file — upload.
@@ -497,15 +584,66 @@ func (e *Engine) scanAndEnqueue() error {
 		return fmt.Errorf("initial scan: %w", err)
 	}
 
-	// Files present previously but absent now were deleted locally — delete
-	// the corresponding remote copies.
-	for path, sf := range prevMap {
-		if _, ok := seen[path]; !ok {
+	// Files present previously but absent now were deleted locally — delete the
+	// corresponding remote copies, unless the direction forbids remote deletes
+	// (download-only never deletes remotely; mirror/backup keeps deleted files).
+	if e.allowsRemoteDelete() {
+		// Collect first so a bulk-delete guard can veto what looks like an
+		// accidental mass deletion (e.g. the local sync folder is on an unmounted
+		// drive and scans as empty) before any remote files are trashed. Online-only
+		// records have no local copy by design, so they are never delete candidates.
+		var toDelete []*models.SyncFile
+		for path, sf := range prevMap {
+			if sf.SyncStatus == models.SyncStatusOnlineOnly {
+				continue
+			}
+			if _, ok := seen[path]; !ok {
+				toDelete = append(toDelete, sf)
+			}
+		}
+		// Only veto deletions when the local sync root itself is missing or
+		// unreadable (unmounted drive / reassigned drive letter) — the case where
+		// every tracked file falsely looks deleted. When the root is present, a
+		// genuine bulk delete propagates in full: deleting a big folder is allowed.
+		if len(toDelete) > 0 && !e.localRootAvailable() {
+			e.sendError(fmt.Errorf("sync: local sync folder %q is missing or unreadable; skipping %d remote deletion(s) until it is back",
+				e.pair.LocalDir, len(toDelete)))
+			return nil
+		}
+		for _, sf := range toDelete {
 			e.enqueueWork(newSyncOperation(sf, models.OpTypeDeleteRemote, e.maxRetries))
 		}
 	}
 
+	// Mirror empty local directories to Drive so the folder structure — not just
+	// files — is preserved (and reproduced on other machines). Only when uploads
+	// are allowed for this direction.
+	if canUpload {
+		if emptyDirs, derr := e.scanner.EmptyDirs(); derr == nil {
+			for _, d := range emptyDirs {
+				if _, rerr := e.resolveRemoteDir(d); rerr != nil {
+					e.sendError(fmt.Errorf("sync: ensure remote folder %s: %w", d, rerr))
+				}
+			}
+		}
+	}
+
+	// Persist the hash cache so the next startup scan can skip re-hashing files
+	// whose size and mtime are unchanged. Best-effort.
+	if p := e.hashCachePath(); p != "" {
+		_ = e.scanner.SaveHashCache(p)
+	}
+
 	return nil
+}
+
+// localRootAvailable reports whether the pair's local sync root currently exists
+// as a readable directory. Used to distinguish a genuine bulk deletion (root
+// present, files removed) from an unmounted/reassigned drive (root gone), so the
+// former propagates and the latter is held back.
+func (e *Engine) localRootAvailable() bool {
+	info, err := os.Stat(longPath(e.pair.LocalDir))
+	return err == nil && info.IsDir()
 }
 
 // enqueueWork adds a SyncOperation to the work queue with a blocking send,
@@ -523,13 +661,51 @@ func (e *Engine) enqueueWork(op *models.SyncOperation) {
 	// when the operation terminally completes in the worker. Retry/pause
 	// re-enqueues send to the channel directly and must not be counted here.
 	atomic.AddInt64(&e.pendingOps, 1)
+	atomic.AddInt64(&e.pendingBytes, opBytes(op))
 	select {
 	case e.workQueue <- op:
 	case <-e.ctx.Done():
 		// Engine is shutting down — this operation will never run, so undo
 		// the backlog increment to keep the pending counter accurate.
 		atomic.AddInt64(&e.pendingOps, -1)
+		atomic.AddInt64(&e.pendingBytes, -opBytes(op))
 	}
+}
+
+// opBytes returns the byte size a transfer operation contributes to the pending
+// backlog. Only uploads and downloads move bytes; deletes/conflicts count as 0.
+func opBytes(op *models.SyncOperation) int64 {
+	if op == nil || op.File == nil {
+		return 0
+	}
+	switch op.OpType {
+	case models.OpTypeUpload, models.OpTypeDownload:
+		return op.File.Size
+	default:
+		return 0
+	}
+}
+
+// enqueueDetached schedules a brand-new operation without ever blocking the
+// caller. It MUST be used instead of enqueueWork whenever the caller is itself a
+// worker goroutine (e.g. deleteRemote/deleteLocal resolving a delete/edit
+// conflict): enqueueWork does a blocking send, so a worker calling it while the
+// queue is full would stall the very goroutines that drain the queue — a
+// deadlock that manifests as uploads no longer being processed. Like
+// enqueueWork it counts the op against the backlog (it is a new op, not a
+// retry), but the send happens on a detached goroutine and honours ctx
+// cancellation, decrementing the counter if the op never makes it onto the queue.
+func (e *Engine) enqueueDetached(op *models.SyncOperation) {
+	atomic.AddInt64(&e.pendingOps, 1)
+	atomic.AddInt64(&e.pendingBytes, opBytes(op))
+	go func() {
+		select {
+		case e.workQueue <- op:
+		case <-e.ctx.Done():
+			atomic.AddInt64(&e.pendingOps, -1)
+			atomic.AddInt64(&e.pendingBytes, -opBytes(op))
+		}
+	}()
 }
 
 // Stop performs a graceful shutdown of the sync engine.
@@ -595,6 +771,48 @@ func (e *Engine) State() SyncState {
 	return e.state
 }
 
+// --- Sync-direction gates ---------------------------------------------------
+// These translate the pair's direction policy (two-way / upload-only /
+// download-only / mirror) into the four primitive permissions the engine acts
+// on. Mirror is upload-only that never deletes on the remote (backup mode).
+
+// allowsUpload reports whether local creations/modifications push to the remote.
+func (e *Engine) allowsUpload() bool {
+	switch e.pair.EffectiveDirection() {
+	case config.SyncDirTwoWay, config.SyncDirUploadOnly, config.SyncDirMirror:
+		return true
+	}
+	return false
+}
+
+// allowsDownload reports whether remote creations/modifications pull to local.
+func (e *Engine) allowsDownload() bool {
+	switch e.pair.EffectiveDirection() {
+	case config.SyncDirTwoWay, config.SyncDirDownloadOnly:
+		return true
+	}
+	return false
+}
+
+// allowsRemoteDelete reports whether a local deletion is propagated to the
+// remote. Mirror (backup) and download-only never delete on the remote.
+func (e *Engine) allowsRemoteDelete() bool {
+	switch e.pair.EffectiveDirection() {
+	case config.SyncDirTwoWay, config.SyncDirUploadOnly:
+		return true
+	}
+	return false
+}
+
+// allowsLocalDelete reports whether a remote deletion is propagated locally.
+func (e *Engine) allowsLocalDelete() bool {
+	switch e.pair.EffectiveDirection() {
+	case config.SyncDirTwoWay, config.SyncDirDownloadOnly:
+		return true
+	}
+	return false
+}
+
 // Stats returns a copy of the current sync statistics (thread-safe).
 func (e *Engine) Stats() SyncStats {
 	e.mu.RLock()
@@ -607,8 +825,9 @@ func (e *Engine) Activity() SyncActivity {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	act := SyncActivity{
-		Pending: int(atomic.LoadInt64(&e.pendingOps)),
-		Active:  len(e.activeOps),
+		Pending:      int(atomic.LoadInt64(&e.pendingOps)),
+		PendingBytes: atomic.LoadInt64(&e.pendingBytes),
+		Active:       len(e.activeOps),
 	}
 	if len(e.activeOps) > 0 {
 		act.Current = make([]string, 0, len(e.activeOps))
@@ -618,6 +837,137 @@ func (e *Engine) Activity() SyncActivity {
 		sort.Strings(act.Current) // stable display order
 	}
 	return act
+}
+
+// ErroredFile describes a tracked file stuck in the error state, for the GUI's
+// Issues view.
+type ErroredFile struct {
+	PairID    string
+	LocalPath string
+}
+
+// ListErrored returns the pair's tracked files currently in the error state
+// (max retries exhausted). Best-effort: returns nil if the store can't be read.
+func (e *Engine) ListErrored() []ErroredFile {
+	files, err := e.store.ListAll(e.pair.ID)
+	if err != nil {
+		return nil
+	}
+	var out []ErroredFile
+	for _, sf := range files {
+		if sf.SyncStatus == models.SyncStatusError {
+			out = append(out, ErroredFile{PairID: e.pair.ID, LocalPath: sf.LocalPath})
+		}
+	}
+	return out
+}
+
+// RetryFailed re-enqueues every errored file for another attempt: an upload when
+// the local copy still exists, otherwise a download of the remote copy. Returns
+// the number of operations re-enqueued. It may block briefly applying queue
+// backpressure, so callers should not hold locks across it.
+func (e *Engine) RetryFailed() int {
+	files, err := e.store.ListAll(e.pair.ID)
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, sf := range files {
+		if sf.SyncStatus != models.SyncStatusError {
+			continue
+		}
+		localPath := filepath.Join(e.pair.LocalDir, sf.LocalPath)
+		switch _, statErr := os.Stat(localPath); {
+		case statErr == nil:
+			e.enqueueWork(newSyncOperation(sf, models.OpTypeUpload, e.maxRetries))
+		case sf.RemoteID != "":
+			e.enqueueWork(newSyncOperation(sf, models.OpTypeDownload, e.maxRetries))
+		default:
+			continue
+		}
+		n++
+	}
+	return n
+}
+
+// PendingConflicts returns a snapshot of all unresolved manual conflicts.
+func (e *Engine) PendingConflicts() []ConflictItem {
+	return e.conflicts.List()
+}
+
+// ResolveConflictAction resolves a manually-queued conflict by applying the
+// given action. It removes the conflict from the queue and enqueues the
+// appropriate sync operation. Returns an error if the conflict is not found.
+func (e *Engine) ResolveConflictAction(localPath string, action config.ConflictPolicy) error {
+	if !e.conflicts.Remove(e.pair.ID, localPath) {
+		return fmt.Errorf("sync: no pending conflict for %s", localPath)
+	}
+
+	existing, err := e.store.GetSyncFile(e.pair.ID, localPath)
+	if err != nil || existing == nil {
+		return fmt.Errorf("sync: no store record for %s", localPath)
+	}
+
+	switch action {
+	case config.ConflictPolicyKeepLocal:
+		e.enqueueWork(newSyncOperation(existing, models.OpTypeUpload, e.maxRetries))
+	case config.ConflictPolicyKeepBoth:
+		// Keep the local copy as a timestamped backup, then pull the remote.
+		// Done directly (not via an OpTypeConflict op) so it doesn't re-enter the
+		// manual-policy path and re-queue itself.
+		e.backupLocalConflictCopy(filepath.Join(e.pair.LocalDir, localPath))
+		e.enqueueWork(newSyncOperation(existing, models.OpTypeDownload, e.maxRetries))
+	default: // keep_remote (and any unknown action) → pull the remote copy.
+		e.enqueueWork(newSyncOperation(existing, models.OpTypeDownload, e.maxRetries))
+	}
+	return nil
+}
+
+// backupLocalConflictCopy copies the local file to a timestamped ".conflict"
+// sibling, best-effort, so a remote-wins resolution preserves the local version.
+func (e *Engine) backupLocalConflictCopy(localPath string) {
+	backupPath := fmt.Sprintf("%s.conflict.%s", localPath, time.Now().Format("20060102-150405"))
+	if src, err := os.Open(longPath(localPath)); err == nil {
+		if dst, err := os.OpenFile(longPath(backupPath), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600); err == nil {
+			_, _ = io.Copy(dst, src)
+			_ = dst.Close()
+		}
+		_ = src.Close()
+	}
+}
+
+// OnlineOnlyCount returns how many online-only placeholder files this pair has
+// (tracked remote files that have not been downloaded).
+func (e *Engine) OnlineOnlyCount() int {
+	files, err := e.store.ListAll(e.pair.ID)
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, sf := range files {
+		if sf.SyncStatus == models.SyncStatusOnlineOnly {
+			n++
+		}
+	}
+	return n
+}
+
+// MakeAvailableOffline enqueues downloads for every online-only placeholder in
+// this pair, materialising them on disk. Returns the number queued. May block
+// briefly on queue backpressure, so callers should not hold locks across it.
+func (e *Engine) MakeAvailableOffline() int {
+	files, err := e.store.ListAll(e.pair.ID)
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, sf := range files {
+		if sf.SyncStatus == models.SyncStatusOnlineOnly && sf.RemoteID != "" {
+			e.enqueueWork(newSyncOperation(sf, models.OpTypeDownload, e.maxRetries))
+			n++
+		}
+	}
+	return n
 }
 
 // markActive records that worker id has begun executing op.
@@ -881,10 +1231,17 @@ func (e *Engine) runWorker(id int) {
 				return
 			}
 
-			// Respect pause state — requeue after a short delay and wait. Both
-			// the delay and the requeue send honour ctx cancellation so this
-			// goroutine cannot block forever (or send) after shutdown.
-			if e.State() == StatePaused {
+			// Respect pause state, quiet hours, and metered network — requeue
+			// after a short delay and wait. Both the delay and the requeue send
+			// honour ctx cancellation so this goroutine cannot block forever.
+			shouldDefer := e.State() == StatePaused
+			if !shouldDefer && e.appCfg.Schedule.QuietHoursEnabled {
+				shouldDefer = IsQuietHours(e.appCfg.Schedule.QuietHoursStart, e.appCfg.Schedule.QuietHoursEnd)
+			}
+			if !shouldDefer && e.appCfg.Schedule.PauseOnMetered {
+				shouldDefer = IsMeteredNetwork()
+			}
+			if shouldDefer {
 				go func(op *models.SyncOperation) {
 					select {
 					case <-time.After(500 * time.Millisecond):
@@ -910,10 +1267,47 @@ func (e *Engine) runWorker(id int) {
 				return
 			}
 
+			// Large-file gate: keep at most maxConcurrentLargeUploads big uploads
+			// in flight (they each buffer a chunk and hog bandwidth). A worker that
+			// can't get a slot re-queues the large op after a short delay and moves
+			// on to the next item — so a burst of large files never starves the
+			// many small-file uploads, which keep running at full concurrency.
+			isLarge := op.OpType == models.OpTypeUpload && op.File != nil && op.File.Size >= largeUploadThreshold
+			if isLarge {
+				select {
+				case e.largeUploadSem <- struct{}{}:
+					// Acquired a large-upload slot.
+				default:
+					go func(op *models.SyncOperation) {
+						select {
+						case <-time.After(largeRequeueDelay):
+						case <-e.ctx.Done():
+							return
+						}
+						select {
+						case e.workQueue <- op:
+						case <-e.ctx.Done():
+						}
+					}(op)
+					continue
+				}
+			}
+
 			e.markActive(id, op)
 			err := e.executeOperation(op)
 			e.markDone(id)
+			if isLarge {
+				<-e.largeUploadSem
+			}
 			if err != nil {
+				// A full-Drive error won't fix itself on retry — exhaust the retry
+				// budget immediately so we fail fast with a clear message instead of
+				// hammering a full account five times with backoff.
+				var quotaErr *drive.QuotaExceededError
+				if errors.As(err, &quotaErr) {
+					op.Attempts = op.MaxAttempts
+				}
+
 				op.Attempts++
 				op.LastError = err.Error()
 
@@ -941,6 +1335,7 @@ func (e *Engine) runWorker(id int) {
 							// Context cancelled during backoff — the op will
 							// never run, so drop it from the backlog.
 							atomic.AddInt64(&e.pendingOps, -1)
+							atomic.AddInt64(&e.pendingBytes, -opBytes(op))
 						}
 					}(op, delay)
 				} else {
@@ -952,11 +1347,13 @@ func (e *Engine) runWorker(id int) {
 					e.sendError(fmt.Errorf("sync: max retries exceeded for %s %s: %w",
 						op.OpType, op.File.LocalPath, err))
 					atomic.AddInt64(&e.pendingOps, -1)
+					atomic.AddInt64(&e.pendingBytes, -opBytes(op))
 				}
 			} else {
 				// Operation succeeded — terminal. Clear it from the backlog,
 				// record it for the activity feed, and update the last sync time.
 				atomic.AddInt64(&e.pendingOps, -1)
+				atomic.AddInt64(&e.pendingBytes, -opBytes(op))
 				e.recordEvent(op)
 				e.mu.Lock()
 				e.stats.LastSyncTime = time.Now()
@@ -978,14 +1375,24 @@ func (e *Engine) runWorker(id int) {
 // executeOperation dispatches a single SyncOperation to the appropriate
 // handler based on its OpType.
 func (e *Engine) executeOperation(op *models.SyncOperation) error {
-	// In forward-only mode, skip download and delete_local operations
-	if e.pair.ForwardOnly {
-		switch op.OpType {
-		case models.OpTypeDownload:
-			// Skip download in forward-only mode
+	// Direction-aware filtering: skip operations the pair's data-flow policy
+	// forbids (defence in depth — generation already gates these). Uses the
+	// gate helpers so the legacy ForwardOnly flag is honoured too.
+	switch op.OpType {
+	case models.OpTypeUpload:
+		if !e.allowsUpload() {
 			return nil
-		case models.OpTypeDeleteLocal:
-			// Skip delete local in forward-only mode
+		}
+	case models.OpTypeDownload:
+		if !e.allowsDownload() {
+			return nil
+		}
+	case models.OpTypeDeleteRemote:
+		if !e.allowsRemoteDelete() {
+			return nil
+		}
+	case models.OpTypeDeleteLocal:
+		if !e.allowsLocalDelete() {
 			return nil
 		}
 	}
@@ -1015,7 +1422,7 @@ func (e *Engine) uploadFile(sf *models.SyncFile) error {
 	localPath := filepath.Join(e.pair.LocalDir, sf.LocalPath)
 
 	// 1. Stat the file to get the size for stats and check limit.
-	info, err := os.Stat(localPath)
+	info, err := os.Stat(longPath(localPath))
 	if err != nil {
 		if os.IsNotExist(err) {
 			// The file was deleted before we got to upload it. Treat this as a
@@ -1057,7 +1464,7 @@ func (e *Engine) uploadFile(sf *models.SyncFile) error {
 	if err != nil {
 		return fmt.Errorf("sync: resolve remote dir for %s: %w", sf.LocalPath, err)
 	}
-	encryptedName, err := crypto.EncryptFilename(filepath.Base(sf.LocalPath), e.masterKey)
+	encryptedName, err := e.encName(filepath.Base(sf.LocalPath))
 	if err != nil {
 		return fmt.Errorf("sync: encrypt filename %s: %w", sf.LocalPath, err)
 	}
@@ -1073,7 +1480,7 @@ func (e *Engine) uploadFile(sf *models.SyncFile) error {
 	pr, pw := io.Pipe()
 	errCh := make(chan error, 1)
 	go func() {
-		f, err := os.Open(localPath)
+		f, err := os.Open(longPath(localPath))
 		if err != nil {
 			err = fmt.Errorf("open local: %w", err)
 			_ = pw.CloseWithError(err)
@@ -1088,11 +1495,34 @@ func (e *Engine) uploadFile(sf *models.SyncFile) error {
 	}()
 
 	// 6. Upload or update on Google Drive.
+	//
+	// For a file we have never recorded (RemoteID == ""), first check whether a
+	// file with this encrypted name already exists in the target folder. This
+	// closes a crash-recovery gap: if a previous run uploaded the file but was
+	// killed before recording it in the store, a plain Create here would silently
+	// create a *second* copy on Drive. Re-using the existing file via Update keeps
+	// the upload idempotent across restarts. Encrypted names are deterministic, so
+	// the lookup reliably finds the prior copy. The extra lookup only runs for
+	// new/untracked files; already-tracked files go straight to Update.
+	remoteID := sf.RemoteID
+	if remoteID == "" {
+		if existing, serr := e.driveClient.SearchByName(e.ctx, encryptedName, parentID); serr == nil {
+			for _, ef := range existing {
+				if !ef.IsFolder() {
+					remoteID = ef.ID
+					break
+				}
+			}
+		}
+		// A failed lookup is non-fatal: fall through to Create. The worst case is
+		// the pre-existing duplicate behaviour, never a lost or corrupt file.
+	}
+
 	var remoteFile *drive.DriveFile
-	if sf.RemoteID == "" {
-		remoteFile, err = e.driveClient.UploadFile(e.ctx, encryptedName, parentID, pr)
+	if remoteID == "" {
+		remoteFile, err = e.driveClient.UploadFile(e.ctx, encryptedName, parentID, pr, info.ModTime())
 	} else {
-		remoteFile, err = e.driveClient.UpdateFile(e.ctx, sf.RemoteID, pr)
+		remoteFile, err = e.driveClient.UpdateFile(e.ctx, remoteID, pr, info.ModTime())
 	}
 
 	// The upload has returned, so Drive is done with the reader. Closing the
@@ -1111,6 +1541,28 @@ func (e *Engine) uploadFile(sf *models.SyncFile) error {
 	}
 	if err != nil {
 		return fmt.Errorf("sync: upload %s: %w", sf.LocalPath, err)
+	}
+
+	// TOCTOU guard: the file is hashed (step 2) and then re-opened and streamed
+	// separately, so it can change in between. If its size or mtime moved, the
+	// bytes now on Drive may not match `hash` — fail the op so it retries with a
+	// fresh hash rather than recording a hash that doesn't describe the uploaded
+	// content. The retry re-uploads via the existing remote ID (or the dedup
+	// lookup), so no duplicate is created.
+	if cur, statErr := os.Stat(longPath(localPath)); statErr == nil {
+		if cur.Size() != info.Size() || !cur.ModTime().Equal(info.ModTime()) {
+			return fmt.Errorf("sync: %s changed during upload; will retry", sf.LocalPath)
+		}
+	}
+
+	// TOCTOU guard phase 2: re-hash the file after the upload stream completed.
+	// The size/mtime check above catches most mutations, but an in-place
+	// overwrite can change content without updating size or mtime (rare, but
+	// possible). Comparing the post-upload hash to the pre-upload hash recorded
+	// in sf.LocalHash catches this case. The retry re-uploads via the existing
+	// remote ID (or dedup lookup), so no duplicate is created.
+	if reHash, rhErr := e.scanner.ComputeHash(localPath); rhErr == nil && reHash != sf.LocalHash {
+		return fmt.Errorf("sync: %s content changed during upload (hash mismatch); will retry", sf.LocalPath)
 	}
 
 	// 7. Upsert the store record with the new remote info and synced status.
@@ -1145,6 +1597,10 @@ func (e *Engine) uploadFile(sf *models.SyncFile) error {
 // Download
 // ---------------------------------------------------------------------------
 
+// diskSpaceHeadroom is the free space kept in reserve beyond a download's own
+// size, so a sync never fills the volume to the last byte.
+const diskSpaceHeadroom = 64 * 1024 * 1024 // 64 MiB
+
 // downloadFile downloads an encrypted file from Google Drive, decrypts it,
 // and writes the plaintext to the local file system.
 func (e *Engine) downloadFile(sf *models.SyncFile) error {
@@ -1157,23 +1613,78 @@ func (e *Engine) downloadFile(sf *models.SyncFile) error {
 
 	// 2. Setup streaming decryption and local write.
 	localPath := filepath.Join(e.pair.LocalDir, sf.LocalPath)
-	if err := os.MkdirAll(filepath.Dir(localPath), 0750); err != nil {
+	dir := filepath.Dir(localPath)
+	if err := os.MkdirAll(longPath(dir), 0750); err != nil {
 		return fmt.Errorf("sync: creating directory for %s: %w", sf.LocalPath, err)
 	}
 
-	f, err := os.Create(localPath)
-	if err != nil {
-		return fmt.Errorf("sync: creating local file %s: %w", localPath, err)
+	// Refuse to start the write if the target volume can't hold the file, rather
+	// than filling the disk and failing partway. sf.Size is the ciphertext size
+	// (a slight overestimate of the plaintext), and we keep a small headroom.
+	if sf.Size > 0 {
+		if avail, derr := availableDiskBytes(dir); derr == nil {
+			needed := uint64(sf.Size) + diskSpaceHeadroom
+			if avail < needed {
+				return fmt.Errorf("sync: not enough disk space for %s: need ~%d MiB, %d MiB free",
+					sf.LocalPath, needed/(1024*1024), avail/(1024*1024))
+			}
+		}
 	}
-	defer f.Close()
 
-	// Decrypt the stream.
-	if err := crypto.DecryptStream(rc, f, e.masterKey, sf.LocalPath); err != nil {
+	// Decrypt into a temporary file in the same directory, then atomically
+	// rename it over the target. This keeps a process kill (or a decrypt failure)
+	// mid-download from ever leaving a truncated, readable file at the real path:
+	// the partial plaintext only lives in a ".tmp" file — which the watcher and
+	// scanner ignore (see DefaultIgnorePatterns) so it is never mistaken for a
+	// user file — and the real path is replaced in a single atomic os.Rename.
+	// Placing the temp file in the same directory guarantees the rename stays on
+	// one volume (cross-device renames fail and aren't atomic).
+	tmp, err := os.CreateTemp(longPath(dir), filepath.Base(localPath)+".gcrypt-part-*.tmp")
+	if err != nil {
+		return fmt.Errorf("sync: creating temp file for %s: %w", sf.LocalPath, err)
+	}
+	tmpPath := tmp.Name()
+	// On any failure below, discard the temp file so partial data never lingers.
+	// The success path sets tmp = nil first, making this a no-op.
+	defer func() {
+		if tmp != nil {
+			_ = tmp.Close()
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	// Decrypt the stream into the temp file.
+	if err := crypto.DecryptStream(rc, tmp, e.masterKey, sf.LocalPath); err != nil {
 		return fmt.Errorf("sync: decrypt stream %s: %w", sf.LocalPath, err)
 	}
 
+	// Flush to disk before the rename so the on-disk file is complete the moment
+	// it appears under the real name, then close it (Windows can't rename over /
+	// from an open handle reliably).
+	if err := tmp.Sync(); err != nil {
+		return fmt.Errorf("sync: flushing %s: %w", sf.LocalPath, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("sync: closing temp file for %s: %w", sf.LocalPath, err)
+	}
+
+	// Atomically move the completed plaintext into place (replacing any existing
+	// file). os.Rename uses MoveFileEx(MOVEFILE_REPLACE_EXISTING) on Windows.
+	if err := os.Rename(tmpPath, longPath(localPath)); err != nil {
+		return fmt.Errorf("sync: finalizing %s: %w", sf.LocalPath, err)
+	}
+	tmp = nil // rename succeeded — disarm the cleanup defer
+
+	// Restore the file's modification time from the remote metadata (uploads
+	// preserve it on Drive), so a downloaded file keeps its original timestamp
+	// instead of showing the download time. Best-effort: a failure here doesn't
+	// invalidate the otherwise-complete download.
+	if !sf.ModTime.IsZero() {
+		_ = os.Chtimes(longPath(localPath), time.Now(), sf.ModTime)
+	}
+
 	// 3. Re-scan the file to get the final local hash and update stats.
-	info, err := f.Stat()
+	info, err := os.Stat(longPath(localPath))
 	if err != nil {
 		return fmt.Errorf("sync: stat downloaded file: %w", err)
 	}
@@ -1210,12 +1721,33 @@ func (e *Engine) downloadFile(sf *models.SyncFile) error {
 // ---------------------------------------------------------------------------
 
 // deleteRemote removes a file from Google Drive and deletes its local store
-// record.
+// record. The remote file is moved to Drive's trash (not permanently deleted),
+// so a propagated deletion stays recoverable from the Drive trash.
 func (e *Engine) deleteRemote(sf *models.SyncFile) error {
-	// 1. If RemoteID is not empty, delete from Drive.
+	// Delete/edit conflict: the local copy was removed, but if the remote copy
+	// was edited since our last sync, trashing it would lose those remote
+	// changes. In a two-way sync the safe resolution is "edit beats delete" —
+	// pull the remote version back locally instead of deleting it. (In
+	// upload-only mode the local side is authoritative, so we still delete.)
+	if sf.RemoteID != "" && e.allowsDownload() {
+		if rf, err := e.driveClient.GetFile(e.ctx, sf.RemoteID); err == nil {
+			if rf.MD5Hash != "" && sf.RemoteHash != "" && rf.MD5Hash != sf.RemoteHash {
+				slog.Warn("delete/edit conflict: remote edited after local delete; restoring local copy",
+					"file", sf.LocalPath)
+				dl := *sf
+				dl.RemoteHash = rf.MD5Hash
+				dl.Size = rf.Size
+				dl.ModTime = rf.ModTime
+				e.enqueueDetached(newSyncOperation(&dl, models.OpTypeDownload, e.maxRetries))
+				return nil
+			}
+		}
+	}
+
+	// 1. If RemoteID is not empty, move the remote copy to trash.
 	if sf.RemoteID != "" {
-		if err := e.driveClient.DeleteFile(e.ctx, sf.RemoteID); err != nil {
-			return fmt.Errorf("sync: delete remote %s: %w", sf.LocalPath, err)
+		if err := e.driveClient.TrashFile(e.ctx, sf.RemoteID); err != nil {
+			return fmt.Errorf("sync: trash remote %s: %w", sf.LocalPath, err)
 		}
 	}
 
@@ -1245,9 +1777,26 @@ func (e *Engine) deleteRemote(sf *models.SyncFile) error {
 
 // deleteLocal removes a local file and its store record.
 func (e *Engine) deleteLocal(sf *models.SyncFile) error {
-	// 1. Delete the local file.
 	localPath := filepath.Join(e.pair.LocalDir, sf.LocalPath)
-	if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
+
+	// Delete/edit conflict: the remote copy is gone, but if the local file has
+	// unsynced edits since our last sync, deleting it would lose them. "Edit
+	// beats delete" — re-upload the local copy to recreate it remotely instead.
+	// (Only when uploads are allowed; download-only treats remote as authoritative.)
+	if e.allowsUpload() {
+		if cur, err := e.scanner.ComputeHash(localPath); err == nil && sf.LocalHash != "" && cur != sf.LocalHash {
+			slog.Warn("delete/edit conflict: local edited after remote delete; restoring remote copy",
+				"file", sf.LocalPath)
+			up := *sf
+			up.RemoteID = "" // old remote was deleted/trashed; recreate it
+			up.LocalHash = cur
+			e.enqueueDetached(newSyncOperation(&up, models.OpTypeUpload, e.maxRetries))
+			return nil
+		}
+	}
+
+	// 1. Delete the local file.
+	if err := os.Remove(longPath(localPath)); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("sync: delete local file %s: %w", localPath, err)
 	}
 
@@ -1268,58 +1817,92 @@ func (e *Engine) deleteLocal(sf *models.SyncFile) error {
 // Conflict Resolution
 // ---------------------------------------------------------------------------
 
-// resolveConflict reconciles a file that changed remotely. If the local copy is
-// untouched since the last sync it simply pulls the remote update; if the local
-// copy also changed it applies last-write-wins, preserving the local copy as a
-// backup when the remote version wins.
+// resolveConflict reconciles a file that changed remotely. The resolution
+// strategy depends on the pair's ConflictPolicy:
+//   - auto: last-write-wins (original behaviour)
+//   - keep_local: always push the local copy
+//   - keep_remote: always pull the remote copy
+//   - keep_both: download remote and keep the local copy as a backup
+//   - manual: queue for resolution via the GUI (no automatic action)
 func (e *Engine) resolveConflict(sf *models.SyncFile) error {
 	localPath := filepath.Join(e.pair.LocalDir, sf.LocalPath)
 
-	// If the local copy is gone, re-create it from the remote. A genuine local
-	// deletion is reconciled separately via delete operations; pulling the
-	// remote here is the safe default and never loses data.
-	if _, statErr := os.Stat(localPath); os.IsNotExist(statErr) {
+	// If the local copy is gone, re-create it from the remote regardless of
+	// policy. A genuine local deletion is reconciled separately via delete
+	// operations; pulling the remote here is the safe default.
+	if _, statErr := os.Stat(longPath(localPath)); os.IsNotExist(statErr) {
 		return e.downloadFile(sf)
 	}
 
-	// If the local copy is unchanged since our last sync (sf.LocalHash is the
-	// content hash recorded then), there is no real conflict — just pull the
-	// remote update without creating a backup.
-	if curHash, err := e.scanner.ComputeHash(localPath); err == nil && curHash == sf.LocalHash {
-		return e.downloadFile(sf)
+	policy := e.pair.ConflictPolicy
+	if policy == "" {
+		policy = config.ConflictPolicyAuto
 	}
 
-	// Both sides diverged — apply last-write-wins by modification time.
-	localModTime := sf.ModTime
-	if info, err := os.Stat(localPath); err == nil {
-		localModTime = info.ModTime()
-	}
-	var remoteModTime time.Time
-	if sf.RemoteID != "" {
-		if remoteFile, err := e.driveClient.GetFile(e.ctx, sf.RemoteID); err == nil {
-			remoteModTime = remoteFile.ModTime
-		}
-	}
-
-	// Local strictly newer → push the local version over the remote.
-	if localModTime.After(remoteModTime) {
+	switch policy {
+	case config.ConflictPolicyKeepLocal:
 		return e.uploadFile(sf)
-	}
 
-	// Remote newer (or identical timestamp) → remote wins: preserve the local
-	// copy as a timestamped backup, then download the remote version.
-	// downloadFile records the new remote hash, so the conflict does not
-	// re-trigger on every subsequent poll. The backup is best-effort and is
-	// streamed so large files are not loaded fully into memory.
-	backupPath := fmt.Sprintf("%s.conflict.%s", localPath, time.Now().Format("20060102-150405"))
-	if src, err := os.Open(localPath); err == nil {
-		if dst, err := os.OpenFile(backupPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600); err == nil {
-			_, _ = io.Copy(dst, src)
-			_ = dst.Close()
+	case config.ConflictPolicyKeepRemote:
+		return e.downloadFile(sf)
+
+	case config.ConflictPolicyKeepBoth:
+		// Back up local, then download remote.
+		e.backupLocalConflictCopy(localPath)
+		return e.downloadFile(sf)
+
+	case config.ConflictPolicyManual:
+		// Queue for manual resolution — don't touch the file.
+		var localModTime time.Time
+		if info, err := os.Stat(longPath(localPath)); err == nil {
+			localModTime = info.ModTime()
 		}
-		_ = src.Close()
+		var remoteModTime time.Time
+		if sf.RemoteID != "" {
+			if remoteFile, err := e.driveClient.GetFile(e.ctx, sf.RemoteID); err == nil {
+				remoteModTime = remoteFile.ModTime
+			}
+		}
+		e.conflicts.Add(ConflictItem{
+			PairID:        e.pair.ID,
+			LocalPath:     sf.LocalPath,
+			RemoteID:      sf.RemoteID,
+			LocalModTime:  localModTime,
+			RemoteModTime: remoteModTime,
+			LocalHash:     sf.LocalHash,
+			RemoteHash:    sf.RemoteHash,
+		})
+		// Mark as conflict in the store so the Issues view picks it up.
+		_ = e.store.UpdateStatus(e.pair.ID, sf.LocalPath, models.SyncStatusConflict)
+		return nil
+
+	default: // auto (last-write-wins)
+		// If the local copy is unchanged since our last sync, just pull.
+		if curHash, err := e.scanner.ComputeHash(localPath); err == nil && curHash == sf.LocalHash {
+			return e.downloadFile(sf)
+		}
+
+		// Both sides diverged — apply last-write-wins by modification time.
+		localModTime := sf.ModTime
+		if info, err := os.Stat(longPath(localPath)); err == nil {
+			localModTime = info.ModTime()
+		}
+		var remoteModTime time.Time
+		if sf.RemoteID != "" {
+			if remoteFile, err := e.driveClient.GetFile(e.ctx, sf.RemoteID); err == nil {
+				remoteModTime = remoteFile.ModTime
+			}
+		}
+
+		// Local strictly newer → push.
+		if localModTime.After(remoteModTime) {
+			return e.uploadFile(sf)
+		}
+
+		// Remote newer (or tie) → remote wins with local backup.
+		e.backupLocalConflictCopy(localPath)
+		return e.downloadFile(sf)
 	}
-	return e.downloadFile(sf)
 }
 
 // ---------------------------------------------------------------------------
@@ -1354,6 +1937,12 @@ func (e *Engine) pollRemoteChanges() {
 			if e.State() == StatePaused {
 				continue
 			}
+			if e.appCfg.Schedule.QuietHoursEnabled && IsQuietHours(e.appCfg.Schedule.QuietHoursStart, e.appCfg.Schedule.QuietHoursEnd) {
+				continue
+			}
+			if e.appCfg.Schedule.PauseOnMetered && IsMeteredNetwork() {
+				continue
+			}
 
 			if err := e.pollOnce(); err != nil {
 				consecutiveErrors++
@@ -1370,25 +1959,121 @@ func (e *Engine) pollRemoteChanges() {
 				consecutiveErrors = 0
 			}
 		case <-e.syncNowCh:
-			// Immediate scan triggered by SyncNow().
+			// Immediate scan triggered by SyncNow(). A manual request always does a
+			// full reconcile rather than the change-gated fast path, so "Sync Now"
+			// is guaranteed to reconcile even if the changes feed reports nothing.
 			if e.State() == StatePaused {
 				continue
 			}
 
-			if err := e.pollOnce(); err != nil {
+			if err := e.reconcileRemote(); err != nil {
 				e.sendError(fmt.Errorf("sync: sync-now poll: %w", err))
 			}
 		}
 	}
 }
 
-// pollOnce performs a single remote poll cycle.
+// pollOnce performs one remote poll cycle. It uses the Drive changes feed as a
+// cheap gate: once a baseline page token exists, it asks Drive only "did
+// anything relevant change since last time?" and skips the full tree
+// enumeration entirely when nothing did. A full reconcile runs on the first
+// poll (to establish the baseline), whenever a relevant change is seen, and as a
+// safe fallback if the changes feed errors or its token has expired.
 func (e *Engine) pollOnce() error {
+	if e.changePageToken == "" {
+		// No baseline yet: capture "now" so subsequent polls are incremental, then
+		// do a full reconcile to catch anything that changed before the token.
+		if token, err := e.driveClient.GetStartPageToken(e.ctx); err == nil {
+			e.changePageToken = token
+		}
+		return e.reconcileRemote()
+	}
+
+	relevant, newToken, err := e.pollChanges()
+	if err != nil {
+		// Feed failed or token expired (410). Drop the token so the next poll
+		// re-establishes a baseline, and reconcile fully now to stay correct.
+		e.changePageToken = ""
+		return e.reconcileRemote()
+	}
+	e.changePageToken = newToken
+	if !relevant {
+		return nil // nothing in our tree changed — skip the full enumeration
+	}
+	return e.reconcileRemote()
+}
+
+// pollChanges drains the account-wide Drive changes feed from the held page
+// token, reporting whether any change touches this pair's tree and returning the
+// new token to hold for next time. A change is relevant when it touches a file
+// gcrypt already tracks for this pair, or a file whose parent is one of the
+// pair's known (cached) folders — which includes newly created files/subfolders
+// under the sync root.
+func (e *Engine) pollChanges() (relevant bool, newToken string, err error) {
+	folderIDs := e.knownFolderIDs()
+
+	tracked := make(map[string]struct{})
+	if files, lerr := e.store.ListAll(e.pair.ID); lerr == nil {
+		for _, sf := range files {
+			if sf.RemoteID != "" {
+				tracked[sf.RemoteID] = struct{}{}
+			}
+		}
+	}
+
+	token := e.changePageToken
+	for {
+		changes, next, newStart, lerr := e.driveClient.ListChanges(e.ctx, token)
+		if lerr != nil {
+			return false, e.changePageToken, lerr
+		}
+		for _, ch := range changes {
+			if _, ok := tracked[ch.FileID]; ok {
+				relevant = true
+				continue
+			}
+			for _, p := range ch.Parents {
+				if _, ok := folderIDs[p]; ok {
+					relevant = true
+					break
+				}
+			}
+		}
+		if next != "" {
+			token = next
+			continue
+		}
+		return relevant, newStart, nil
+	}
+}
+
+// knownFolderIDs returns the set of Drive folder IDs that make up this pair's
+// tree: the pair's root folder plus every subfolder discovered (and cached)
+// during reconciliation.
+func (e *Engine) knownFolderIDs() map[string]struct{} {
+	e.folderMu.Lock()
+	ids := make(map[string]struct{}, len(e.folderCache)+1)
+	for _, id := range e.folderCache {
+		ids[id] = struct{}{}
+	}
+	e.folderMu.Unlock()
+	ids[e.pair.DriveFolderID] = struct{}{}
+	return ids
+}
+
+// reconcileRemote performs a full remote poll cycle: it enumerates the pair's
+// Drive tree and generates download/conflict/delete operations as needed.
+func (e *Engine) reconcileRemote() error {
 	// Enumerate all remote files with their decrypted local paths (flat or
-	// hierarchical layout, transparently).
-	remoteFiles, err := e.collectRemoteFiles()
+	// hierarchical layout, transparently), plus every remote folder discovered.
+	remoteFiles, remoteDirs, err := e.collectRemoteFiles()
 	if err != nil {
 		return fmt.Errorf("list remote files: %w", err)
+	}
+
+	// Mirror remote folders locally only when this direction pulls to local.
+	if e.allowsDownload() {
+		e.ensureLocalDirs(remoteDirs)
 	}
 
 	// Build a set of remote IDs currently tracked in the store.
@@ -1404,52 +2089,95 @@ func (e *Engine) pollOnce() error {
 		}
 	}
 
-	// Skip both download and delete-local generation in forward-only mode.
-	if e.pair.ForwardOnly {
+	// Nothing to do remote→local for upload-only / mirror directions.
+	if !e.allowsDownload() && !e.allowsLocalDelete() {
 		return nil
 	}
 
-	for _, rf := range remoteFiles {
-		tracked, isTracked := remoteByID[rf.ID]
-		if !isTracked {
-			// New remote file → download.
-			sf := &models.SyncFile{
-				LocalPath:  rf.LocalPath,
-				RemoteID:   rf.ID,
-				RemoteHash: rf.RemoteHash,
-				Size:       rf.Size,
-				ModTime:    rf.ModTime,
-			}
-			e.enqueueWork(newSyncOperation(sf, models.OpTypeDownload, e.maxRetries))
-			continue
-		}
+	if e.allowsDownload() {
+		// Detect remote files that would collide on a case-insensitive / Unicode-
+		// normalising local filesystem (Windows, macOS): two distinct remote names
+		// mapping to the same local path. Downloading both would silently clobber
+		// one, so keep the first and skip the rest, reporting each collision.
+		collisionSkip := e.detectCollisions(remoteFiles)
+		twoWay := e.pair.EffectiveDirection() == config.SyncDirTwoWay
 
-		// Already tracked: detect a remote modification (e.g. another machine
-		// edited the file) by comparing the Drive content hash against what we
-		// recorded at the last sync. Without this, edits to existing files never
-		// propagate — only new files and deletions would. A change is reconciled
-		// via conflict resolution, which pulls the remote update when the local
-		// copy is untouched and otherwise backs up the local copy first.
-		if rf.RemoteHash != "" && tracked.RemoteHash != "" && rf.RemoteHash != tracked.RemoteHash {
-			sf := &models.SyncFile{
-				LocalPath:  tracked.LocalPath,
-				RemoteID:   rf.ID,
-				RemoteHash: rf.RemoteHash,
-				LocalHash:  tracked.LocalHash,
-				Size:       rf.Size,
-				ModTime:    rf.ModTime,
+		for _, rf := range remoteFiles {
+			if _, skip := collisionSkip[rf.ID]; skip {
+				continue
 			}
-			e.enqueueWork(newSyncOperation(sf, models.OpTypeConflict, e.maxRetries))
+			tracked, isTracked := remoteByID[rf.ID]
+			if !isTracked {
+				// New remote file. In on-demand (online-only) mode, record it as a
+				// tracked placeholder instead of downloading — it can be fetched
+				// later via "make available offline".
+				sf := &models.SyncFile{
+					SyncRootID: e.pair.ID,
+					LocalPath:  rf.LocalPath,
+					RemoteID:   rf.ID,
+					RemoteHash: rf.RemoteHash,
+					Size:       rf.Size,
+					ModTime:    rf.ModTime,
+				}
+				if e.pair.OnlineOnly {
+					sf.SyncStatus = models.SyncStatusOnlineOnly
+					if perr := e.store.PutSyncFile(sf); perr != nil {
+						e.sendError(fmt.Errorf("sync: record online-only file %s: %w", sf.LocalPath, perr))
+					}
+					continue
+				}
+				e.enqueueWork(newSyncOperation(sf, models.OpTypeDownload, e.maxRetries))
+				continue
+			}
+
+			// Already tracked: detect a remote modification by comparing the Drive
+			// content hash against what we recorded at the last sync.
+			if rf.RemoteHash != "" && tracked.RemoteHash != "" && rf.RemoteHash != tracked.RemoteHash {
+				// An online-only placeholder isn't on disk; just refresh its recorded
+				// hash so we don't re-detect the change every poll.
+				if tracked.SyncStatus == models.SyncStatusOnlineOnly {
+					tracked.RemoteHash = rf.RemoteHash
+					tracked.Size = rf.Size
+					tracked.ModTime = rf.ModTime
+					if perr := e.store.PutSyncFile(tracked); perr != nil {
+						e.sendError(fmt.Errorf("sync: update online-only file %s: %w", tracked.LocalPath, perr))
+					}
+					continue
+				}
+				sf := &models.SyncFile{
+					SyncRootID: e.pair.ID,
+					LocalPath:  tracked.LocalPath,
+					RemoteID:   rf.ID,
+					RemoteHash: rf.RemoteHash,
+					LocalHash:  tracked.LocalHash,
+					Size:       rf.Size,
+					ModTime:    rf.ModTime,
+				}
+				// In two-way mode a remote edit may clash with a local edit → run
+				// conflict resolution (honours the pair's ConflictPolicy). In
+				// download-only mode the remote always wins → straight download.
+				if twoWay {
+					e.enqueueWork(newSyncOperation(sf, models.OpTypeConflict, e.maxRetries))
+				} else {
+					e.enqueueWork(newSyncOperation(sf, models.OpTypeDownload, e.maxRetries))
+				}
+			}
 		}
 	}
 
-	// For each store file not in the remote list → create a delete_local operation.
-	remoteIDLookup := make(map[string]struct{}, len(remoteFiles))
-	for _, rf := range remoteFiles {
-		remoteIDLookup[rf.ID] = struct{}{}
-	}
-	for _, sf := range trackedFiles {
-		if sf.RemoteID != "" {
+	// For each store file no longer present remotely → delete locally, if this
+	// direction propagates remote deletions. A successful remote enumeration is
+	// authoritative (collectRemoteFiles aborts the reconcile on any API error),
+	// so a bulk remote delete propagates in full.
+	if e.allowsLocalDelete() {
+		remoteIDLookup := make(map[string]struct{}, len(remoteFiles))
+		for _, rf := range remoteFiles {
+			remoteIDLookup[rf.ID] = struct{}{}
+		}
+		for _, sf := range trackedFiles {
+			if sf.RemoteID == "" {
+				continue
+			}
 			if _, exists := remoteIDLookup[sf.RemoteID]; !exists {
 				e.enqueueWork(newSyncOperation(sf, models.OpTypeDeleteLocal, e.maxRetries))
 			}
@@ -1473,19 +2201,19 @@ type remoteFileInfo struct {
 // the encrypted folder tree, returning each file with its decrypted local
 // relative path. Objects whose names cannot be decrypted (not created by gcrypt,
 // or a different key) are skipped.
-func (e *Engine) collectRemoteFiles() ([]remoteFileInfo, error) {
-	var acc []remoteFileInfo
-	if err := e.collectRemoteHierarchical(e.pair.DriveFolderID, "", &acc); err != nil {
-		return nil, err
+func (e *Engine) collectRemoteFiles() (files []remoteFileInfo, dirs []string, err error) {
+	if err := e.collectRemoteHierarchical(e.pair.DriveFolderID, "", &files, &dirs); err != nil {
+		return nil, nil, err
 	}
-	return acc, nil
+	return files, dirs, nil
 }
 
 // collectRemoteHierarchical recursively walks the encrypted Drive folder tree
 // rooted at folderID, which maps to the plaintext relative directory relDir
-// ("" = the sync root). It appends decrypted file entries to acc and caches the
-// IDs of folders it discovers so later uploads can reuse them.
-func (e *Engine) collectRemoteHierarchical(folderID, relDir string, acc *[]remoteFileInfo) error {
+// ("" = the sync root). It appends decrypted file entries to acc, every
+// discovered subfolder's relative path to dirs, and caches the IDs of folders
+// it discovers so later uploads can reuse them.
+func (e *Engine) collectRemoteHierarchical(folderID, relDir string, acc *[]remoteFileInfo, dirs *[]string) error {
 	pageToken := ""
 	for {
 		files, next, err := e.driveClient.ListFiles(e.ctx, folderID, pageToken)
@@ -1504,7 +2232,8 @@ func (e *Engine) collectRemoteHierarchical(folderID, relDir string, acc *[]remot
 			}
 			if rf.IsFolder() {
 				e.cacheRemoteDir(childRel, rf.ID)
-				if err := e.collectRemoteHierarchical(rf.ID, childRel, acc); err != nil {
+				*dirs = append(*dirs, childRel)
+				if err := e.collectRemoteHierarchical(rf.ID, childRel, acc, dirs); err != nil {
 					return err
 				}
 				continue
@@ -1523,6 +2252,47 @@ func (e *Engine) collectRemoteHierarchical(folderID, relDir string, acc *[]remot
 		pageToken = next
 	}
 	return nil
+}
+
+// ensureLocalDirs creates the local directories corresponding to the given
+// remote folder relative paths (slash-separated), so empty remote folders are
+// mirrored locally. Only the folders discovered in the current reconcile are
+// passed in, so a folder deleted remotely is not resurrected.
+func (e *Engine) ensureLocalDirs(dirs []string) {
+	for _, rel := range dirs {
+		local := filepath.Join(e.pair.LocalDir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(longPath(local), 0750); err != nil {
+			e.sendError(fmt.Errorf("sync: create local folder %s: %w", rel, err))
+		}
+	}
+}
+
+// detectCollisions finds remote files whose local paths would collide on a
+// case-insensitive / Unicode-normalising filesystem (Windows, macOS). It returns
+// the set of remote IDs to skip — the first file seen for each colliding key is
+// kept, the rest are skipped — and reports each collision so the user can rename
+// one side. Without this, the second download would silently overwrite the first.
+func (e *Engine) detectCollisions(files []remoteFileInfo) map[string]struct{} {
+	seen := make(map[string]remoteFileInfo, len(files))
+	skip := make(map[string]struct{})
+	for _, rf := range files {
+		key := collisionKey(rf.LocalPath)
+		if first, ok := seen[key]; ok {
+			skip[rf.ID] = struct{}{}
+			e.sendError(fmt.Errorf("sync: filename collision on this filesystem between %q and %q — keeping the first and skipping the second; rename one in Drive to sync both",
+				first.LocalPath, rf.LocalPath))
+			continue
+		}
+		seen[key] = rf
+	}
+	return skip
+}
+
+// collisionKey case-folds and Unicode-normalises (NFC) a local path so names
+// differing only by case or normalisation map to the same key, matching how
+// Windows and macOS treat them.
+func collisionKey(localPath string) string {
+	return norm.NFC.String(strings.ToLower(filepath.ToSlash(localPath)))
 }
 
 // resolveRemoteDir returns the Drive folder ID for the given plaintext relative
@@ -1562,7 +2332,7 @@ func (e *Engine) resolveRemoteDir(relDir string) (string, error) {
 			return "", err
 		}
 		comp := path.Base(slashDir)
-		encName, err := crypto.EncryptFilename(comp, e.masterKey)
+		encName, err := e.encName(comp)
 		if err != nil {
 			return "", fmt.Errorf("encrypt dir component %q: %w", comp, err)
 		}
@@ -1668,7 +2438,7 @@ func (e *Engine) lookupRemoteDirID(slashDir string) (string, bool) {
 			parentID = id
 			continue
 		}
-		encName, err := crypto.EncryptFilename(comp, e.masterKey)
+		encName, err := e.encName(comp)
 		if err != nil {
 			return "", false
 		}

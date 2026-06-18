@@ -74,14 +74,43 @@ func isRateLimitError(err error) bool {
 	return false
 }
 
-// wrapAPIError wraps a Google Drive API error, returning a RateLimitError
-// for 429 responses or a generic wrapped error otherwise.
+// QuotaExceededError is returned when Google Drive rejects an upload because the
+// account's storage quota is full. Callers can detect it to surface a clear
+// "storage full" message and to avoid pointless retries (it won't self-resolve).
+type QuotaExceededError struct {
+	Err error
+}
+
+func (e *QuotaExceededError) Error() string {
+	return "drive: Google Drive storage is full — free up space or upgrade your plan"
+}
+func (e *QuotaExceededError) Unwrap() error { return e.Err }
+
+// isQuotaExceeded reports whether a Google API error is a storage-quota-full
+// rejection (HTTP 403 with reason "storageQuotaExceeded").
+func isQuotaExceeded(err error) bool {
+	if gerr, ok := err.(*googleapi.Error); ok && gerr.Code == 403 {
+		for _, e := range gerr.Errors {
+			if e.Reason == "storageQuotaExceeded" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// wrapAPIError wraps a Google Drive API error, returning a typed error for
+// recognised conditions (429 rate limit, storage-quota-full) or a generic
+// wrapped error otherwise.
 func wrapAPIError(err error) error {
 	if err == nil {
 		return nil
 	}
 	if isRateLimitError(err) {
 		return &RateLimitError{Err: err}
+	}
+	if isQuotaExceeded(err) {
+		return &QuotaExceededError{Err: err}
 	}
 	return fmt.Errorf("drive: %w", err)
 }
@@ -223,10 +252,16 @@ func (c *Client) EnsureFolderUnder(ctx context.Context, parentID, name string) (
 
 // UploadFile uploads content as a new file with the given name under the
 // specified parent folder on Google Drive.
-func (c *Client) UploadFile(ctx context.Context, name string, parentID string, content io.Reader) (*DriveFile, error) {
+func (c *Client) UploadFile(ctx context.Context, name string, parentID string, content io.Reader, modTime time.Time) (*DriveFile, error) {
 	file := &drive.File{
 		Name:    name,
 		Parents: []string{parentID},
+	}
+	// Preserve the source file's modification time on Drive so it round-trips back
+	// to the local copy on download (rather than every synced file showing its
+	// upload time). A zero modTime leaves Drive to default it to "now".
+	if !modTime.IsZero() {
+		file.ModifiedTime = modTime.UTC().Format(time.RFC3339Nano)
 	}
 
 	result, err := c.svc.Files.Create(file).
@@ -283,6 +318,38 @@ func (c *Client) ListFiles(ctx context.Context, parentID string, pageToken strin
 	return files, list.NextPageToken, nil
 }
 
+// AccountInfo holds the signed-in user's identity and Drive storage quota,
+// as reported by the Drive "about" resource.
+type AccountInfo struct {
+	Email       string
+	DisplayName string
+	QuotaUsed   int64 // bytes used across Drive
+	QuotaLimit  int64 // total bytes available; 0 means unlimited / not reported
+}
+
+// About fetches the signed-in user's email and Drive storage quota. It is a
+// single lightweight metadata call, suitable for periodic refresh in the UI.
+func (c *Client) About(ctx context.Context) (*AccountInfo, error) {
+	about, err := c.svc.About.Get().
+		Fields("user(displayName,emailAddress),storageQuota(limit,usage)").
+		Context(ctx).
+		Do()
+	if err != nil {
+		return nil, wrapAPIError(err)
+	}
+
+	info := &AccountInfo{}
+	if about.User != nil {
+		info.Email = about.User.EmailAddress
+		info.DisplayName = about.User.DisplayName
+	}
+	if about.StorageQuota != nil {
+		info.QuotaUsed = about.StorageQuota.Usage
+		info.QuotaLimit = about.StorageQuota.Limit
+	}
+	return info, nil
+}
+
 // GetFile retrieves metadata for a single file by its ID.
 func (c *Client) GetFile(ctx context.Context, fileID string) (*DriveFile, error) {
 	result, err := c.svc.Files.Get(fileID).
@@ -297,6 +364,8 @@ func (c *Client) GetFile(ctx context.Context, fileID string) (*DriveFile, error)
 }
 
 // DeleteFile permanently deletes the file with the given ID from Google Drive.
+// It bypasses the trash, so the file is unrecoverable. Used for housekeeping of
+// gcrypt's own empty encrypted folders; user file deletions go through TrashFile.
 func (c *Client) DeleteFile(ctx context.Context, fileID string) error {
 	err := c.svc.Files.Delete(fileID).
 		Context(ctx).
@@ -308,9 +377,78 @@ func (c *Client) DeleteFile(ctx context.Context, fileID string) error {
 	return nil
 }
 
-// UpdateFile replaces the content of an existing file on Google Drive.
-func (c *Client) UpdateFile(ctx context.Context, fileID string, content io.Reader) (*DriveFile, error) {
-	result, err := c.svc.Files.Update(fileID, &drive.File{}).
+// TrashFile moves the file with the given ID to Google Drive's trash instead of
+// deleting it permanently. This makes a propagated deletion recoverable: the
+// user (or another machine) can restore the file from Drive trash within the
+// retention window. Used for user file deletions.
+func (c *Client) TrashFile(ctx context.Context, fileID string) error {
+	_, err := c.svc.Files.Update(fileID, &drive.File{Trashed: true}).
+		Context(ctx).
+		Do()
+	if err != nil {
+		return wrapAPIError(err)
+	}
+
+	return nil
+}
+
+// ChangeItem is a single entry from the Drive changes feed, reduced to what the
+// sync engine needs to decide whether a change is relevant to a sync pair.
+type ChangeItem struct {
+	FileID  string   // the changed file's ID
+	Removed bool     // the file was removed or is no longer accessible
+	Trashed bool     // the file was moved to trash
+	Parents []string // current parent folder IDs (empty for removed files)
+}
+
+// GetStartPageToken returns an opaque token marking "now" in the account-wide
+// changes feed. A later ListChanges(token) returns everything that changed
+// since. Persist/hold the token between polls to drive incremental syncing.
+func (c *Client) GetStartPageToken(ctx context.Context) (string, error) {
+	res, err := c.svc.Changes.GetStartPageToken().Context(ctx).Do()
+	if err != nil {
+		return "", wrapAPIError(err)
+	}
+	return res.StartPageToken, nil
+}
+
+// ListChanges fetches one page of changes since pageToken. It returns the page's
+// changes plus two tokens: nextPageToken is non-empty when more pages remain
+// (call again with it), and newStartPageToken is non-empty on the final page —
+// hold onto it for the next poll cycle. The changes feed is account-wide, so
+// callers must filter to the files/folders they care about.
+func (c *Client) ListChanges(ctx context.Context, pageToken string) (items []ChangeItem, nextPageToken, newStartPageToken string, err error) {
+	res, err := c.svc.Changes.List(pageToken).
+		Spaces("drive").
+		IncludeRemoved(true).
+		Fields("nextPageToken,newStartPageToken,changes(fileId,removed,file(id,trashed,parents))").
+		Context(ctx).
+		Do()
+	if err != nil {
+		return nil, "", "", wrapAPIError(err)
+	}
+
+	items = make([]ChangeItem, 0, len(res.Changes))
+	for _, ch := range res.Changes {
+		item := ChangeItem{FileID: ch.FileId, Removed: ch.Removed}
+		if ch.File != nil {
+			item.Trashed = ch.File.Trashed
+			item.Parents = ch.File.Parents
+		}
+		items = append(items, item)
+	}
+	return items, res.NextPageToken, res.NewStartPageToken, nil
+}
+
+// UpdateFile replaces the content of an existing file on Google Drive. modTime,
+// when non-zero, sets the file's modification time so it round-trips on download.
+func (c *Client) UpdateFile(ctx context.Context, fileID string, content io.Reader, modTime time.Time) (*DriveFile, error) {
+	meta := &drive.File{}
+	if !modTime.IsZero() {
+		meta.ModifiedTime = modTime.UTC().Format(time.RFC3339Nano)
+	}
+
+	result, err := c.svc.Files.Update(fileID, meta).
 		Media(limitUploadReader(content), googleapi.ChunkSize(uploadChunkSize)).
 		Fields("id,name,mimeType,size,modifiedTime,md5Checksum,parents").
 		Context(ctx).

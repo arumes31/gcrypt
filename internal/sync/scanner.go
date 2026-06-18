@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -24,6 +26,59 @@ type hashCacheEntry struct {
 	size    int64
 	modTime time.Time
 	digest  string
+}
+
+// persistedHashEntry is the JSON-serialisable form of hashCacheEntry, used to
+// persist the hash cache across restarts so a cold start doesn't re-hash the
+// whole tree. ModTime marshals as RFC3339Nano, so it round-trips exactly.
+type persistedHashEntry struct {
+	Size    int64     `json:"size"`
+	ModTime time.Time `json:"mtime"`
+	Digest  string    `json:"hash"`
+}
+
+// LoadHashCache seeds the in-memory hash cache from a JSON file previously
+// written by SaveHashCache. It returns the underlying error when the file is
+// missing or unreadable (and on malformed JSON), so the caller can distinguish a
+// cold start — a missing cache file — from a corrupt one. Entries are validated
+// against the live file stamp on use, so a stale entry can never return a wrong
+// hash — at worst it forces a recompute.
+func (s *Scanner) LoadHashCache(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var in map[string]persistedHashEntry
+	if err := json.Unmarshal(data, &in); err != nil {
+		return err
+	}
+	s.muCache.Lock()
+	for k, v := range in {
+		s.hashCache[k] = hashCacheEntry{size: v.Size, modTime: v.ModTime, digest: v.Digest}
+	}
+	s.muCache.Unlock()
+	return nil
+}
+
+// SaveHashCache writes the in-memory hash cache to path atomically (temp file +
+// rename) so a crash can't leave a half-written cache.
+func (s *Scanner) SaveHashCache(path string) error {
+	s.muCache.RLock()
+	out := make(map[string]persistedHashEntry, len(s.hashCache))
+	for k, v := range s.hashCache {
+		out[k] = persistedHashEntry{Size: v.size, ModTime: v.modTime, Digest: v.digest}
+	}
+	s.muCache.RUnlock()
+
+	data, err := json.Marshal(out)
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // Scanner performs full and single-file directory scans, producing
@@ -199,6 +254,91 @@ func (s *Scanner) ScanStream(ctx context.Context, out chan<- *models.SyncFile) e
 	})
 
 	return g.Wait()
+}
+
+// inSelectedFolder reports whether the slash-relative path falls within the
+// configured selected folders. With none configured, everything is in scope.
+func (s *Scanner) inSelectedFolder(rel string) bool {
+	if len(s.selectedFolders) == 0 {
+		return true
+	}
+	for _, folder := range s.selectedFolders {
+		nf := filepath.ToSlash(filepath.Clean(folder))
+		if nf == "." {
+			nf = ""
+		}
+		if nf == "" || rel == nf || strings.HasPrefix(rel, nf+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// EmptyDirs returns the relative, slash-separated paths of directories under the
+// sync root that contain no non-ignored regular files anywhere in their subtree.
+// Such directories would otherwise never be represented remotely, because remote
+// folders are normally created only as a side effect of uploading a file. It
+// honours the same ignore and selected-folder rules as ScanStream.
+func (s *Scanner) EmptyDirs() ([]string, error) {
+	dirs := make(map[string]struct{})
+	withFile := make(map[string]struct{})
+
+	walkErr := filepath.WalkDir(s.dir, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			if os.IsPermission(err) {
+				if d != nil && d.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			return err
+		}
+		if p == s.dir {
+			return nil
+		}
+		if s.ignore.Match(p) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		rel, rerr := filepath.Rel(s.dir, p)
+		if rerr != nil {
+			return nil
+		}
+		rel = filepath.ToSlash(rel)
+
+		if !s.inSelectedFolder(rel) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		if d.IsDir() {
+			dirs[rel] = struct{}{}
+			return nil
+		}
+		if info, ierr := d.Info(); ierr != nil || !info.Mode().IsRegular() {
+			return nil
+		}
+		// Mark every ancestor directory as containing a file.
+		for a := path.Dir(rel); a != "." && a != "/" && a != ""; a = path.Dir(a) {
+			withFile[a] = struct{}{}
+		}
+		return nil
+	})
+	if walkErr != nil {
+		return nil, walkErr
+	}
+
+	var empty []string
+	for dir := range dirs {
+		if _, has := withFile[dir]; !has {
+			empty = append(empty, dir)
+		}
+	}
+	return empty, nil
 }
 
 // ScanSingle scans a single file and returns its SyncFile record.

@@ -54,7 +54,7 @@ func TestDefaultConfig(t *testing.T) {
 
 func TestDefaultIgnorePatterns(t *testing.T) {
 	patterns := DefaultIgnorePatterns()
-	expected := []string{"~$*", "*.tmp", "*.swp", ".DS_Store", "Thumbs.db", "desktop.ini"}
+	expected := []string{"~$*", "*~", ".~lock.*#", "*.lock", "*.tmp", "*.swp", ".DS_Store", "Thumbs.db", "desktop.ini"}
 	if len(patterns) != len(expected) {
 		t.Fatalf("DefaultIgnorePatterns length = %d, want %d", len(patterns), len(expected))
 	}
@@ -495,6 +495,32 @@ func TestValidate(t *testing.T) {
 				App:        AppConfig{LogLevel: "info", LogMaxSize: 10, LogMaxBackups: 3},
 			},
 			wantErr: "",
+		},
+		{
+			name: "overlapping local dirs",
+			cfg: &Config{
+				Version: 2,
+				SyncPairs: []SyncPair{
+					{ID: "id1", LocalDir: "/data/docs", DriveFolderID: "f1", SyncInterval: 30},
+					{ID: "id2", LocalDir: "/data/docs/sub", DriveFolderID: "f2", SyncInterval: 30},
+				},
+				Encryption: EncryptionConfig{PassphraseHash: "hash"},
+				App:        AppConfig{LogLevel: "info", LogMaxSize: 10, LogMaxBackups: 3},
+			},
+			wantErr: "overlap",
+		},
+		{
+			name: "duplicate drive folder",
+			cfg: &Config{
+				Version: 2,
+				SyncPairs: []SyncPair{
+					{ID: "id1", LocalDir: "/dir1", DriveFolderID: "sameFolder", SyncInterval: 30},
+					{ID: "id2", LocalDir: "/dir2", DriveFolderID: "sameFolder", SyncInterval: 30},
+				},
+				Encryption: EncryptionConfig{PassphraseHash: "hash"},
+				App:        AppConfig{LogLevel: "info", LogMaxSize: 10, LogMaxBackups: 3},
+			},
+			wantErr: "same Drive folder",
 		},
 	}
 

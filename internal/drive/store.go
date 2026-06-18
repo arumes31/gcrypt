@@ -3,7 +3,10 @@ package drive
 import (
 	"database/sql"
 	"fmt"
+	"log/slog"
+	"os"
 	"sync"
+	"time"
 
 	"github.com/arumes31/gcrypt/internal/models"
 	"github.com/google/uuid"
@@ -66,23 +69,22 @@ CREATE INDEX IF NOT EXISTS idx_sync_map_root_status ON sync_map(sync_root_id, sy
 // defaultRootID is used as the sync root ID during V1→V2 migration. If empty,
 // a new UUID is generated. For fresh databases the parameter is unused.
 func NewStore(dbPath string, defaultRootID string) (*Store, error) {
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := openStore(dbPath)
 	if err != nil {
-		return nil, fmt.Errorf("store: failed to open database: %w", err)
-	}
-
-	// Enable foreign keys and optimize performance with WAL mode.
-	if _, err := db.Exec("PRAGMA foreign_keys = ON"); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("store: failed to enable foreign keys: %w", err)
-	}
-	if _, err := db.Exec("PRAGMA journal_mode = WAL"); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("store: failed to enable WAL mode: %w", err)
-	}
-	if _, err := db.Exec("PRAGMA synchronous = NORMAL"); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("store: failed to set synchronous: %w", err)
+		// The database could not be opened or failed its integrity check. The
+		// sync map is a rebuildable cache (re-derived from Drive + local files on
+		// the next scan), so rather than failing to launch we quarantine the bad
+		// file and start fresh. The dedup-on-upload and remote-reconcile logic
+		// then re-establishes all mappings without duplicating cloud data.
+		slog.Warn("store: database unusable; quarantining and rebuilding",
+			"path", dbPath, "error", err.Error())
+		if qerr := quarantineDB(dbPath); qerr != nil {
+			return nil, fmt.Errorf("store: quarantine unusable db: %w", qerr)
+		}
+		db, err = openStore(dbPath)
+		if err != nil {
+			return nil, fmt.Errorf("store: open fresh db after rebuild: %w", err)
+		}
 	}
 
 	// Apply V2 schema (CREATE IF NOT EXISTS is idempotent for new databases).
@@ -222,6 +224,59 @@ func migrateV1ToV2(db *sql.DB, defaultRootID string) error {
 		return fmt.Errorf("commit migration: %w", err)
 	}
 
+	return nil
+}
+
+// openStore opens the SQLite database at dbPath, applies the connection
+// pragmas, and verifies the file with PRAGMA quick_check. It returns an error if
+// the database cannot be opened or fails the integrity check (the caller may
+// then quarantine the file and retry with a fresh one). A new/empty database
+// passes the check.
+func openStore(dbPath string) (*sql.DB, error) {
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("open: %w", err)
+	}
+	for _, pragma := range []string{
+		"PRAGMA foreign_keys = ON",
+		"PRAGMA journal_mode = WAL",
+		"PRAGMA synchronous = NORMAL",
+	} {
+		if _, err := db.Exec(pragma); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("pragma %q: %w", pragma, err)
+		}
+	}
+	// quick_check is far cheaper than integrity_check and still catches the
+	// structural corruption that would otherwise crash queries at runtime.
+	var res string
+	if err := db.QueryRow("PRAGMA quick_check").Scan(&res); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("integrity check: %w", err)
+	}
+	if res != "ok" {
+		_ = db.Close()
+		return nil, fmt.Errorf("integrity check failed: %s", res)
+	}
+	return db, nil
+}
+
+// quarantineDB renames a corrupt database aside (with a timestamped suffix),
+// along with its -wal/-shm sidecars, so a fresh database can take its place. If
+// the main file can't be renamed (e.g. locked) it is removed instead.
+func quarantineDB(dbPath string) error {
+	suffix := ".corrupt-" + time.Now().Format("20060102-150405")
+	if _, err := os.Stat(dbPath); err == nil {
+		if err := os.Rename(dbPath, dbPath+suffix); err != nil {
+			if rmErr := os.Remove(dbPath); rmErr != nil {
+				return err
+			}
+		}
+	}
+	// Sidecars are best-effort; a leftover -wal/-shm for a fresh db is harmless.
+	for _, side := range []string{"-wal", "-shm"} {
+		_ = os.Rename(dbPath+side, dbPath+side+suffix)
+	}
 	return nil
 }
 

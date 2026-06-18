@@ -82,8 +82,11 @@ func (im *IgnoreMatcher) matchBuiltIn(rel string) bool {
 		}
 	}
 
-	// Glob patterns for built-in ignores.
-	globBuiltIn := []string{"*.tmp", "~$*", "*.swp"}
+	// Glob patterns for built-in ignores. These cover transient editor/office
+	// artifacts that are never meaningful to sync: temp files (*.tmp, *.swp),
+	// MS Office owner files (~$*), editor backup files (*~), and LibreOffice/
+	// OpenOffice lock files (.~lock.<name>#).
+	globBuiltIn := []string{"*.tmp", "~$*", "*.swp", "*~", ".~lock.*#"}
 	for _, pat := range globBuiltIn {
 		if matched, _ := filepath.Match(pat, name); matched {
 			return true
@@ -257,6 +260,9 @@ func DefaultIgnorePatterns() []string {
 		"*.tmp",
 		"~$*",
 		"*.swp",
+		"*~",
+		".~lock.*#",
+		"*.lock",
 		".git/",
 	}
 }

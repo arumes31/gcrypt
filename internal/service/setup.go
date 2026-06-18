@@ -61,6 +61,10 @@ func RunSetup(ctrl *AppController, logger *Logger) error {
 			messageBox("gcrypt setup", "Passphrase cannot be empty.", mbOK|mbIconWarning)
 			continue
 		}
+		if err := crypto.CheckPassphraseStrength(p1); err != nil {
+			messageBox("gcrypt setup", "Weak passphrase: "+err.Error(), mbOK|mbIconWarning)
+			continue
+		}
 		p2, ok := promptText("gcrypt setup — Confirm passphrase",
 			"Re-enter your passphrase to confirm.", "", true)
 		if !ok {
