@@ -25,6 +25,57 @@ import (
 // upload.
 const uploadChunkSize = 8 * 1024 * 1024 // 8 MiB
 
+// driveAPIQueriesPerSec caps the Drive API request rate across the whole
+// process. Google's per-user quota is ~12,000 queries/minute (~200/s); we stay
+// well under it because a single sync operation issues several queries (a dedup
+// search, creating the encrypted parent-folder chain, then the upload itself)
+// and failed requests are retried. Crucially the cap is enforced at the HTTP
+// transport, so EVERY request counts against it — across all sync pairs, plus
+// resumable-upload chunks and token refreshes — which is exactly what Google's
+// quota measures. A previous per-operation limiter under-counted (one token per
+// op, but several queries per op), so a large backlog blew the per-minute quota.
+const driveAPIQueriesPerSec = 100
+
+// apiLimiter is process-global because Google's quota is per user, not per
+// client or per sync pair.
+var apiLimiter = newAPIRateLimiter(driveAPIQueriesPerSec)
+
+// apiRateLimiter is a simple ticker-based token source shared by every Drive
+// HTTP request.
+type apiRateLimiter struct{ ticker *time.Ticker }
+
+func newAPIRateLimiter(qps int) *apiRateLimiter {
+	if qps < 1 {
+		qps = 1
+	}
+	return &apiRateLimiter{ticker: time.NewTicker(time.Second / time.Duration(qps))}
+}
+
+// wait blocks until the next token is available or ctx is cancelled.
+func (l *apiRateLimiter) wait(ctx context.Context) error {
+	select {
+	case <-l.ticker.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// rateLimitedRoundTripper gates every outgoing HTTP request through apiLimiter
+// so the Drive API query rate stays within Google's per-user quota regardless of
+// how many queries each high-level operation performs.
+type rateLimitedRoundTripper struct {
+	base    http.RoundTripper
+	limiter *apiRateLimiter
+}
+
+func (rt *rateLimitedRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if err := rt.limiter.wait(req.Context()); err != nil {
+		return nil, err
+	}
+	return rt.base.RoundTrip(req)
+}
+
 // Client wraps the Google Drive API service and provides high-level operations
 // for file and folder management within the gcrypt root folder. The underlying
 // *drive.Service (an http.Client) is safe for concurrent use, and every field is
@@ -125,10 +176,9 @@ func NewClient(ctx context.Context, oauthCfg OAuthConfig, token *oauth2.Token, f
 	}
 
 	// Build the OAuth HTTP client on top of a transport with finite timeouts so a
-	// stalled Drive request can never hang forever. That matters a lot here: Drive
-	// operations are serialised through c.mu, so one wedged request would block
-	// every worker (the sync appears to "stop" with no error). These are
-	// transport-level timeouts that abort dead connections without capping the
+	// stalled Drive request can never hang forever (uploads run concurrently, so a
+	// wedged connection must not be able to tie up a worker indefinitely). These
+	// are transport-level timeouts that abort dead connections without capping the
 	// total duration of a legitimately long, still-progressing transfer.
 	base := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
@@ -149,7 +199,11 @@ func NewClient(ctx context.Context, oauthCfg OAuthConfig, token *oauth2.Token, f
 	// silently breaking all Drive operations and stalling the sync. Use
 	// context.Background() for refreshes; per-request deadlines are applied via
 	// each API call's own Context() instead.
-	refreshCtx := context.WithValue(context.Background(), oauth2.HTTPClient, &http.Client{Transport: base})
+	// Gate every outgoing request through the process-global API rate limiter so
+	// the Drive query rate (across all pairs, upload chunks and token refreshes)
+	// stays within Google's per-user quota.
+	limited := &rateLimitedRoundTripper{base: base, limiter: apiLimiter}
+	refreshCtx := context.WithValue(context.Background(), oauth2.HTTPClient, &http.Client{Transport: limited})
 	httpClient := config.Client(refreshCtx, token)
 
 	// NewService may perform API discovery — bound that to the caller's ctx.

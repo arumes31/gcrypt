@@ -141,9 +141,21 @@ type Config struct {
 // Default values
 // ---------------------------------------------------------------------------
 
-// DefaultIgnorePatterns returns the default ignore patterns list.
+// DefaultIgnorePatterns returns the default ignore patterns list. Note that
+// gcrypt also has non-overridable built-in ignores for directories that should
+// never be synced (.git, .svn, .hg, node_modules, .gcrypt) — those apply even
+// when a pair sets its own patterns. The entries here are the softer, overridable
+// defaults used for pairs that have not customised their patterns: transient
+// editor/office artifacts plus common dependency, build and cache trees.
 func DefaultIgnorePatterns() []string {
-	return []string{"~$*", "*~", ".~lock.*#", "*.lock", "*.tmp", "*.swp", ".DS_Store", "Thumbs.db", "desktop.ini"}
+	return []string{
+		// Transient editor / office / OS artifacts.
+		"~$*", "*~", ".~lock.*#", "*.lock", "*.tmp", "*.swp", ".DS_Store", "Thumbs.db", "desktop.ini",
+		// Dependency, build and cache trees.
+		"vendor", "dist", "build", "target", "bin", "obj",
+		"__pycache__", ".venv", "venv", ".mypy_cache", ".pytest_cache",
+		".idea", ".vscode", ".gradle", ".next", ".nuxt", ".cache",
+	}
 }
 
 // DefaultConfig returns a Config populated with sensible defaults.
