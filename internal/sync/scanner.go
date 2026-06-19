@@ -102,6 +102,17 @@ func NewScanner(dir string, ignorePatterns []string, selectedFolders []string) *
 	}
 }
 
+// ShouldIgnore reports whether the given path is excluded by this scanner's
+// ignore rules — the pair's user patterns plus the built-in never-sync set
+// (.git, node_modules, …) matched at any depth. The local walk applies these
+// implicitly; exposing them lets the remote reconcile apply the exact same
+// exclusions, so a file ignored locally is never pulled back from Drive (the
+// old upload path may have pushed now-ignored trees to the cloud). The path may
+// be absolute or relative to the sync root; Match normalises it either way.
+func (s *Scanner) ShouldIgnore(path string) bool {
+	return s.ignore.Match(path)
+}
+
 // Scan performs a full recursive walk of the sync directory and returns
 // a SyncFile entry for every non-ignored file found.
 //

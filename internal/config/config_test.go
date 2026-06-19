@@ -54,13 +54,18 @@ func TestDefaultConfig(t *testing.T) {
 
 func TestDefaultIgnorePatterns(t *testing.T) {
 	patterns := DefaultIgnorePatterns()
-	expected := []string{"~$*", "*~", ".~lock.*#", "*.lock", "*.tmp", "*.swp", ".DS_Store", "Thumbs.db", "desktop.ini"}
-	if len(patterns) != len(expected) {
-		t.Fatalf("DefaultIgnorePatterns length = %d, want %d", len(patterns), len(expected))
+	set := make(map[string]bool, len(patterns))
+	for _, p := range patterns {
+		set[p] = true
 	}
-	for i, p := range expected {
-		if patterns[i] != p {
-			t.Errorf("pattern[%d] = %q, want %q", i, patterns[i], p)
+	// Both the transient-artifact patterns and the common build/dependency trees
+	// must be present (order-independent, so adding more later won't break this).
+	for _, want := range []string{
+		"~$*", "*~", ".~lock.*#", "*.lock", "*.tmp", "*.swp", ".DS_Store", "Thumbs.db", "desktop.ini",
+		"vendor", "dist", "build", "target", "__pycache__", ".venv",
+	} {
+		if !set[want] {
+			t.Errorf("DefaultIgnorePatterns missing %q", want)
 		}
 	}
 }

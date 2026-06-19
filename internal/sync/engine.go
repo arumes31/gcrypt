@@ -92,8 +92,12 @@ type ActivityKind string
 const (
 	ActivityUpload   ActivityKind = "upload"
 	ActivityDownload ActivityKind = "download"
-	ActivityDelete   ActivityKind = "delete"
-	ActivityConflict ActivityKind = "conflict"
+	// ActivityDelete is a generic delete, kept for backward compatibility; the
+	// engine now records the more specific remote/local kinds below.
+	ActivityDelete       ActivityKind = "delete"
+	ActivityDeleteRemote ActivityKind = "delete_remote" // local removal propagated to the cloud
+	ActivityDeleteLocal  ActivityKind = "delete_local"  // cloud removal propagated to disk
+	ActivityConflict     ActivityKind = "conflict"
 )
 
 // ActivityEvent is a single completed sync operation, recorded for the
@@ -150,6 +154,16 @@ type Engine struct {
 	// file follows many tiny ones. Accessed atomically; incremented/decremented
 	// in lock-step with pendingOps.
 	pendingBytes int64
+
+	// liveBytesUp/liveBytesDown count transfer bytes as they stream over the
+	// wire, incremented from the up/download data path (not in one lump at file
+	// completion). The live transfer-rate display samples deltas of these, so a
+	// large file shows real throughput throughout instead of 0 B/s during the
+	// transfer and a single end-of-file spike. Accessed atomically. They include
+	// retransmitted bytes on retry (correct for a rate), so they are a throughput
+	// odometer, not a count of distinct bytes stored.
+	liveBytesUp   int64
+	liveBytesDown int64
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -813,11 +827,34 @@ func (e *Engine) allowsLocalDelete() bool {
 	return false
 }
 
-// Stats returns a copy of the current sync statistics (thread-safe).
+// Stats returns a copy of the current sync statistics (thread-safe). The byte
+// counters are sourced from the live atomic odometers so the figure advances
+// during a transfer rather than jumping only when each file finishes.
 func (e *Engine) Stats() SyncStats {
 	e.mu.RLock()
-	defer e.mu.RUnlock()
-	return e.stats
+	s := e.stats
+	e.mu.RUnlock()
+	s.BytesUploaded = atomic.LoadInt64(&e.liveBytesUp)
+	s.BytesDownloaded = atomic.LoadInt64(&e.liveBytesDown)
+	return s
+}
+
+// countingReader wraps an io.Reader, atomically adding the number of bytes read
+// to *counter as the stream is consumed. Wrapping the upload/download data
+// stream with this makes the live transfer-rate reflect bytes as they move over
+// the wire, instead of the whole file size landing in a single sample at
+// completion (which showed 0 B/s during a large transfer, then a huge spike).
+type countingReader struct {
+	r       io.Reader
+	counter *int64
+}
+
+func (cr *countingReader) Read(p []byte) (int, error) {
+	n, err := cr.r.Read(p)
+	if n > 0 {
+		atomic.AddInt64(cr.counter, int64(n))
+	}
+	return n, err
 }
 
 // Activity returns a snapshot of in-flight and queued work (thread-safe).
@@ -1046,8 +1083,10 @@ func activityKindForOp(t models.OpType) ActivityKind {
 		return ActivityUpload
 	case models.OpTypeDownload:
 		return ActivityDownload
-	case models.OpTypeDeleteRemote, models.OpTypeDeleteLocal:
-		return ActivityDelete
+	case models.OpTypeDeleteRemote:
+		return ActivityDeleteRemote
+	case models.OpTypeDeleteLocal:
+		return ActivityDeleteLocal
 	case models.OpTypeConflict:
 		return ActivityConflict
 	default:
@@ -1518,11 +1557,15 @@ func (e *Engine) uploadFile(sf *models.SyncFile) error {
 		// the pre-existing duplicate behaviour, never a lost or corrupt file.
 	}
 
+	// Count ciphertext bytes as Drive pulls them from the pipe, so the live
+	// transfer rate tracks real upload progress for this (possibly large) file.
+	countingPR := &countingReader{r: pr, counter: &e.liveBytesUp}
+
 	var remoteFile *drive.DriveFile
 	if remoteID == "" {
-		remoteFile, err = e.driveClient.UploadFile(e.ctx, encryptedName, parentID, pr, info.ModTime())
+		remoteFile, err = e.driveClient.UploadFile(e.ctx, encryptedName, parentID, countingPR, info.ModTime())
 	} else {
-		remoteFile, err = e.driveClient.UpdateFile(e.ctx, remoteID, pr, info.ModTime())
+		remoteFile, err = e.driveClient.UpdateFile(e.ctx, remoteID, countingPR, info.ModTime())
 	}
 
 	// The upload has returned, so Drive is done with the reader. Closing the
@@ -1584,10 +1627,10 @@ func (e *Engine) uploadFile(sf *models.SyncFile) error {
 		return fmt.Errorf("sync: record uploaded file %s: %w", sf.LocalPath, err)
 	}
 
-	// 8. Update stats.
+	// 8. Update stats. Byte throughput is tallied live via countingPR above; here
+	// we only bump the completed-file counter.
 	e.mu.Lock()
 	e.stats.FilesUploaded++
-	e.stats.BytesUploaded += info.Size()
 	e.mu.Unlock()
 
 	return nil
@@ -1653,8 +1696,11 @@ func (e *Engine) downloadFile(sf *models.SyncFile) error {
 		}
 	}()
 
-	// Decrypt the stream into the temp file.
-	if err := crypto.DecryptStream(rc, tmp, e.masterKey, sf.LocalPath); err != nil {
+	// Decrypt the stream into the temp file. Count ciphertext bytes as they
+	// arrive so the live transfer rate tracks real download progress for this
+	// (possibly large) file rather than spiking only when it finishes.
+	countingRC := &countingReader{r: rc, counter: &e.liveBytesDown}
+	if err := crypto.DecryptStream(countingRC, tmp, e.masterKey, sf.LocalPath); err != nil {
 		return fmt.Errorf("sync: decrypt stream %s: %w", sf.LocalPath, err)
 	}
 
@@ -1683,9 +1729,9 @@ func (e *Engine) downloadFile(sf *models.SyncFile) error {
 		_ = os.Chtimes(longPath(localPath), time.Now(), sf.ModTime)
 	}
 
-	// 3. Re-scan the file to get the final local hash and update stats.
-	info, err := os.Stat(longPath(localPath))
-	if err != nil {
+	// 3. Re-scan the file to get the final local hash and update stats. The stat
+	// confirms the finalised file is present before we record it as synced.
+	if _, err := os.Stat(longPath(localPath)); err != nil {
 		return fmt.Errorf("sync: stat downloaded file: %w", err)
 	}
 
@@ -1707,10 +1753,10 @@ func (e *Engine) downloadFile(sf *models.SyncFile) error {
 		return fmt.Errorf("sync: record downloaded file %s: %w", sf.LocalPath, err)
 	}
 
-	// 5. Update stats.
+	// 5. Update stats. Byte throughput is tallied live via countingRC above; here
+	// we only bump the completed-file counter.
 	e.mu.Lock()
 	e.stats.FilesDownloaded++
-	e.stats.BytesDownloaded += info.Size()
 	e.mu.Unlock()
 
 	return nil
@@ -2106,6 +2152,24 @@ func (e *Engine) reconcileRemote() error {
 			if _, skip := collisionSkip[rf.ID]; skip {
 				continue
 			}
+			// Honour the ignore rules on the remote side too. An older build (or a
+			// pre-ignore config) may have uploaded now-ignored trees such as
+			// node_modules/ or .git/ to Drive; never pull them back down. Tracked
+			// ignored files are trashed by the local scan's deletion pass; untracked
+			// remote orphans have no store record to drive that, so trash them here
+			// when the direction permits remote deletion (recoverable from Drive
+			// trash). Without this, two-way sync would re-download the junk the
+			// upload side now skips — an endless restart-time churn.
+			if e.scanner.ShouldIgnore(filepath.Join(e.pair.LocalDir, rf.LocalPath)) {
+				if _, isTracked := remoteByID[rf.ID]; !isTracked && e.allowsRemoteDelete() {
+					e.enqueueWork(newSyncOperation(&models.SyncFile{
+						SyncRootID: e.pair.ID,
+						LocalPath:  rf.LocalPath,
+						RemoteID:   rf.ID,
+					}, models.OpTypeDeleteRemote, e.maxRetries))
+				}
+				continue
+			}
 			tracked, isTracked := remoteByID[rf.ID]
 			if !isTracked {
 				// New remote file. In on-demand (online-only) mode, record it as a
@@ -2144,12 +2208,43 @@ func (e *Engine) reconcileRemote() error {
 					}
 					continue
 				}
+				// The "remote hash differs" signal is noisy. The stored hash is the
+				// MD5 of the *ciphertext* we uploaded, which is non-deterministic (a
+				// fresh random nonce per upload), and reconcile compares the store and
+				// the Drive listing as snapshots taken moments apart. So a file we are
+				// actively re-uploading locally can look like it "changed remotely"
+				// when it did not — which previously raised spurious conflicts and
+				// downloaded over live local data. Re-validate against fresh state and
+				// only proceed on a genuine external divergence.
+				fresh, ferr := e.store.GetSyncFile(e.ctx, e.pair.ID, tracked.LocalPath)
+				if ferr != nil || fresh == nil || fresh.RemoteHash == "" {
+					continue // can't confirm — never risk clobbering the local copy
+				}
+				// (a) Our own newer upload already caught up: the record now matches
+				//     the listing, so the earlier mismatch was just a stale snapshot.
+				if fresh.RemoteHash == rf.RemoteHash {
+					continue
+				}
+				// (b) An unsynced LOCAL change exists (or the file is mid-write): the
+				//     upload path owns this file. Pulling the remote would overwrite a
+				//     newer local version and, for a constantly-rewritten file, loop
+				//     forever. Let the upload reconcile the hashes instead.
+				lp := filepath.Join(e.pair.LocalDir, tracked.LocalPath)
+				if cur, herr := e.scanner.ComputeHash(lp); herr != nil || cur != fresh.LocalHash {
+					continue
+				}
+				// (c) The listing may itself be stale; confirm against the current
+				//     remote object. If Drive still matches our latest recorded upload,
+				//     nothing actually diverged.
+				if cf, cerr := e.driveClient.GetFile(e.ctx, rf.ID); cerr == nil && cf != nil && cf.MD5Hash == fresh.RemoteHash {
+					continue
+				}
 				sf := &models.SyncFile{
 					SyncRootID: e.pair.ID,
-					LocalPath:  tracked.LocalPath,
+					LocalPath:  fresh.LocalPath,
 					RemoteID:   rf.ID,
 					RemoteHash: rf.RemoteHash,
-					LocalHash:  tracked.LocalHash,
+					LocalHash:  fresh.LocalHash,
 					Size:       rf.Size,
 					ModTime:    rf.ModTime,
 				}

@@ -93,10 +93,24 @@ func (im *IgnoreMatcher) matchBuiltIn(rel string) bool {
 		}
 	}
 
-	// Directory-specific built-in patterns.
-	dirBuiltIn := []string{".gcrypt", ".git"}
-	for _, dir := range dirBuiltIn {
-		if rel == dir || strings.HasPrefix(rel, dir+"/") {
+	// Directory names that are never worth syncing — gcrypt's own metadata,
+	// version-control directories, and dependency trees. A file is ignored when
+	// ANY component of its path is one of these, so they are skipped at any depth
+	// (a previous version only matched them at the sync root, so nested copies
+	// such as a sub-project's .git/ or node_modules/ leaked through and flooded
+	// the queue). These are built-in and cannot be re-included by user patterns.
+	neverSyncDirs := map[string]bool{
+		".gcrypt":      true,
+		".git":         true,
+		".svn":         true,
+		".hg":          true,
+		"node_modules": true,
+	}
+	for _, comp := range strings.Split(rel, "/") {
+		// Case-insensitive, matching the strings.EqualFold checks above: on
+		// case-insensitive filesystems (Windows, macOS) ".Git" or "Node_Modules"
+		// is the same directory and must be ignored too. Map keys are lowercase.
+		if neverSyncDirs[strings.ToLower(comp)] {
 			return true
 		}
 	}

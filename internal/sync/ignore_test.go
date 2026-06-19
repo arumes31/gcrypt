@@ -26,6 +26,17 @@ func TestIgnoreMatcherBuiltIn(t *testing.T) {
 		filepath.Join(rootDir, "file.swp"),
 		filepath.Join(rootDir, ".git"),
 		filepath.Join(rootDir, ".git", "config"),
+		// Never-sync directories must be ignored at ANY depth, not just the root.
+		filepath.Join(rootDir, "node_modules"),
+		filepath.Join(rootDir, "node_modules", "left-pad", "index.js"),
+		filepath.Join(rootDir, "proj", "node_modules", "x", "y.js"),
+		filepath.Join(rootDir, "proj", ".git", "FETCH_HEAD"),
+		filepath.Join(rootDir, "proj", ".svn", "entries"),
+		filepath.Join(rootDir, "proj", ".hg", "store"),
+		// Case variants must still match on case-insensitive filesystems.
+		filepath.Join(rootDir, ".Git", "config"),
+		filepath.Join(rootDir, "Node_Modules", "left-pad", "index.js"),
+		filepath.Join(rootDir, "proj", "NODE_MODULES", "x.js"),
 	}
 
 	for _, path := range builtInIgnored {

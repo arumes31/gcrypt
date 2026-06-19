@@ -1,0 +1,54 @@
+# This is a sample .goreleaser.yaml file with some sensible defaults.
+# For more info, check out https://goreleaser.com
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - windows
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    main: ./cmd/gcrypt/main.go
+    binary: gcrypt
+    # Shared ldflags for all platforms. -H=windowsgui is NOT here: it is a
+    # Windows-only linker flag (GUI subsystem, no console window) and breaks
+    # linux/darwin builds, so it lives in the windows override below.
+    ldflags:
+      - -s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}}
+    overrides:
+      - goos: windows
+        ldflags:
+          - -s -w -H=windowsgui -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}}
+
+archives:
+  - name_template: >-
+      {{ .ProjectName }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "386" }}i386
+      {{- else }}{{ .Arch }}{{ end }}
+      {{- if .Arm }}v{{ .Arm }}{{ end }}
+    format_overrides:
+      - goos: windows
+        format: zip
+
+checksum:
+  name_template: 'checksums.txt'
+
+snapshot:
+  name_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
