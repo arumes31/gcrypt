@@ -25,16 +25,26 @@ FROM alpine:latest
 
 RUN apk add --no-cache ca-certificates tzdata
 
-WORKDIR /root/
+# Run as a non-root user. Base alpine has no shadow `useradd`, so use BusyBox
+# `adduser`. The app must live under the user's home (not /root, which is mode
+# 0700 and unusable by a non-root user).
+RUN adduser -D -h /home/gcrypt gcrypt
+
+WORKDIR /home/gcrypt
 
 # Copy the binary from the builder
 COPY --from=builder /app/gcrypt .
 
-# Create a directory for the sync folder
-RUN mkdir -p /data/sync
+# Create the sync folder and hand it plus the binary/home to the non-root user.
+# (config.Save creates /home/gcrypt/.config/gcrypt itself at runtime.)
+RUN mkdir -p /data/sync \
+    && chown -R gcrypt:gcrypt /data/sync /home/gcrypt
 
-# Set environment variables
-ENV GCRYPT_CONFIG_PATH=/root/.config/gcrypt/config.yaml
+# Set environment variables (config lives under the non-root user's home)
+ENV GCRYPT_CONFIG_PATH=/home/gcrypt/.config/gcrypt/config.yaml
+
+# Switch to the non-root user for execution
+USER gcrypt
 
 # Command to run
 ENTRYPOINT ["./gcrypt"]

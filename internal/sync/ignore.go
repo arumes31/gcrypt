@@ -107,7 +107,10 @@ func (im *IgnoreMatcher) matchBuiltIn(rel string) bool {
 		"node_modules": true,
 	}
 	for _, comp := range strings.Split(rel, "/") {
-		if neverSyncDirs[comp] {
+		// Case-insensitive, matching the strings.EqualFold checks above: on
+		// case-insensitive filesystems (Windows, macOS) ".Git" or "Node_Modules"
+		// is the same directory and must be ignored too. Map keys are lowercase.
+		if neverSyncDirs[strings.ToLower(comp)] {
 			return true
 		}
 	}

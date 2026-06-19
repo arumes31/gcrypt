@@ -33,6 +33,10 @@ func TestIgnoreMatcherBuiltIn(t *testing.T) {
 		filepath.Join(rootDir, "proj", ".git", "FETCH_HEAD"),
 		filepath.Join(rootDir, "proj", ".svn", "entries"),
 		filepath.Join(rootDir, "proj", ".hg", "store"),
+		// Case variants must still match on case-insensitive filesystems.
+		filepath.Join(rootDir, ".Git", "config"),
+		filepath.Join(rootDir, "Node_Modules", "left-pad", "index.js"),
+		filepath.Join(rootDir, "proj", "NODE_MODULES", "x.js"),
 	}
 
 	for _, path := range builtInIgnored {
