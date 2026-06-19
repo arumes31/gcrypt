@@ -20,7 +20,7 @@ import (
 )
 
 // Version is the application version, embedded at build time.
-const Version = "0.1.0"
+const Version = "0.1.3"
 
 var (
 	flagConfig  string

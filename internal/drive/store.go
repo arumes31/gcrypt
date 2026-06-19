@@ -243,20 +243,21 @@ func openStore(dbPath string) (*sql.DB, error) {
 	// to, so it uses a background context.
 	ctx := context.Background()
 
-	db, err := sql.Open("sqlite", dbPath)
+	// Apply pragmas via the DSN so they take effect on EVERY pooled connection.
+	// foreign_keys is a per-connection setting: running "PRAGMA foreign_keys=ON"
+	// through database/sql only configures whichever single connection happens to
+	// serve that call, leaving others with enforcement off — fragile when the
+	// pool opens more than one connection. journal_mode=WAL is database-level once
+	// set, but is harmless (and clearer) to request per connection too.
+	dsn := fmt.Sprintf("file:%s?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)", dbPath)
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open: %w", err)
 	}
-	for _, pragma := range []string{
-		"PRAGMA foreign_keys = ON",
-		"PRAGMA journal_mode = WAL",
-		"PRAGMA synchronous = NORMAL",
-	} {
-		if _, err := db.ExecContext(ctx, pragma); err != nil {
-			_ = db.Close()
-			return nil, fmt.Errorf("pragma %q: %w", pragma, err)
-		}
-	}
+	// All Store methods serialise on s.mu, so a single underlying connection is
+	// sufficient and removes any chance of a pragma applying to only part of the
+	// pool (and of SQLite "database is locked" contention between pooled conns).
+	db.SetMaxOpenConns(1)
 	// quick_check is far cheaper than integrity_check and still catches the
 	// structural corruption that would otherwise crash queries at runtime.
 	var res string
@@ -501,13 +502,26 @@ func (s *Store) UpdateRemoteInfo(ctx context.Context, syncRootID, localPath, rem
 
 // UpsertSyncRoot inserts a new sync root or updates an existing one (matched
 // by ID).
+//
+// It MUST NOT use INSERT OR REPLACE: SQLite implements REPLACE as DELETE-then-
+// INSERT on a primary-key conflict, and sync_map references sync_roots with
+// ON DELETE CASCADE. With foreign_keys=ON, replacing an existing root therefore
+// deletes every sync_map row for that root. Because the app upserts each
+// configured pair's root on every startup, that wiped the entire sync map on
+// each launch, making the client re-upload all files after every restart. The
+// ON CONFLICT ... DO UPDATE form updates the row in place, leaving children
+// (and the cascade) untouched.
 func (s *Store) UpsertSyncRoot(ctx context.Context, root *models.SyncRoot) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	const query = `
-	INSERT OR REPLACE INTO sync_roots (id, local_dir, drive_folder_id, updated_at)
+	INSERT INTO sync_roots (id, local_dir, drive_folder_id, updated_at)
 	VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+	ON CONFLICT(id) DO UPDATE SET
+		local_dir = excluded.local_dir,
+		drive_folder_id = excluded.drive_folder_id,
+		updated_at = CURRENT_TIMESTAMP
 	`
 
 	_, err := s.db.ExecContext(ctx, query, root.ID, root.LocalDir, root.DriveFolderID)
