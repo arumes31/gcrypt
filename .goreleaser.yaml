@@ -18,8 +18,15 @@ builds:
       - arm64
     main: ./cmd/gcrypt/main.go
     binary: gcrypt
+    # Shared ldflags for all platforms. -H=windowsgui is NOT here: it is a
+    # Windows-only linker flag (GUI subsystem, no console window) and breaks
+    # linux/darwin builds, so it lives in the windows override below.
     ldflags:
-      - -s -w -H=windowsgui -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}}
+      - -s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}}
+    overrides:
+      - goos: windows
+        ldflags:
+          - -s -w -H=windowsgui -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}}
 
 archives:
   - name_template: >-

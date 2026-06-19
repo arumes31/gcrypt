@@ -19,8 +19,15 @@ import (
 	"github.com/arumes31/gcrypt/internal/service"
 )
 
-// Version is the application version, embedded at build time.
-const Version = "0.1.3"
+// version, commit, and date hold build metadata. They are package-level
+// variables (not constants) because the linker's -X flag can only override
+// variables, e.g. goreleaser sets -X main.version=… -X main.commit=… -X
+// main.date=…. The defaults apply to plain `go build` / build.ps1 builds.
+var (
+	version = "0.1.3"
+	commit  = ""
+	date    = ""
+)
 
 var (
 	flagConfig  string
@@ -111,7 +118,9 @@ func main() {
 	}
 
 	logger.Info("gcrypt starting", map[string]interface{}{
-		"version": Version,
+		"version": version,
+		"commit":  commit,
+		"date":    date,
 	})
 
 	// Ensure the GUI has a usable OpenGL implementation before Fyne initialises.

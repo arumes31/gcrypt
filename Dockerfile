@@ -13,10 +13,11 @@ RUN go mod download
 # Copy source code
 COPY . .
 
-# Build the application
-# We use CGO_ENABLED=0 for a static binary if possible, 
-# but systray/sqlite might need CGO on some platforms.
-# For a headless Linux container, we might skip the tray.
+# Build the application.
+# CGO is disabled (CGO_ENABLED=0) deliberately: the SQLite layer uses the
+# pure-Go driver modernc.org/sqlite (see internal/drive/store.go), so the
+# database needs no C toolchain or libc linkage and the binary stays fully
+# static. (No mattn/go-sqlite3 / CGO dependency is imported anywhere.)
 RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o gcrypt ./cmd/gcrypt/main.go
 
 # Final stage
