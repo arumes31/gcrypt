@@ -118,6 +118,10 @@ func activityGlyph(k syncpkg.ActivityKind) string {
 		return "↑"
 	case syncpkg.ActivityDownload:
 		return "↓"
+	case syncpkg.ActivityDeleteRemote:
+		return "🗑↑" // removed from the cloud
+	case syncpkg.ActivityDeleteLocal:
+		return "🗑↓" // removed on this device
 	case syncpkg.ActivityDelete:
 		return "🗑"
 	case syncpkg.ActivityConflict:
@@ -127,13 +131,19 @@ func activityGlyph(k syncpkg.ActivityKind) string {
 	}
 }
 
-// activityVerb returns a Nextcloud-style human verb for an activity kind.
+// activityVerb returns a human description for an activity kind, spelling out
+// the direction (which side changed and where it propagated) so the feed reads
+// unambiguously, e.g. "Uploaded to cloud" vs "Deleted in cloud".
 func activityVerb(k syncpkg.ActivityKind) string {
 	switch k {
 	case syncpkg.ActivityUpload:
-		return "You changed"
+		return "Uploaded to cloud"
 	case syncpkg.ActivityDownload:
-		return "Downloaded"
+		return "Downloaded from cloud"
+	case syncpkg.ActivityDeleteRemote:
+		return "Deleted in cloud"
+	case syncpkg.ActivityDeleteLocal:
+		return "Deleted locally"
 	case syncpkg.ActivityDelete:
 		return "Deleted"
 	case syncpkg.ActivityConflict:

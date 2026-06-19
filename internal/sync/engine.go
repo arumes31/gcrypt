@@ -92,8 +92,12 @@ type ActivityKind string
 const (
 	ActivityUpload   ActivityKind = "upload"
 	ActivityDownload ActivityKind = "download"
-	ActivityDelete   ActivityKind = "delete"
-	ActivityConflict ActivityKind = "conflict"
+	// ActivityDelete is a generic delete, kept for backward compatibility; the
+	// engine now records the more specific remote/local kinds below.
+	ActivityDelete       ActivityKind = "delete"
+	ActivityDeleteRemote ActivityKind = "delete_remote" // local removal propagated to the cloud
+	ActivityDeleteLocal  ActivityKind = "delete_local"  // cloud removal propagated to disk
+	ActivityConflict     ActivityKind = "conflict"
 )
 
 // ActivityEvent is a single completed sync operation, recorded for the
@@ -1079,8 +1083,10 @@ func activityKindForOp(t models.OpType) ActivityKind {
 		return ActivityUpload
 	case models.OpTypeDownload:
 		return ActivityDownload
-	case models.OpTypeDeleteRemote, models.OpTypeDeleteLocal:
-		return ActivityDelete
+	case models.OpTypeDeleteRemote:
+		return ActivityDeleteRemote
+	case models.OpTypeDeleteLocal:
+		return ActivityDeleteLocal
 	case models.OpTypeConflict:
 		return ActivityConflict
 	default:
@@ -2202,12 +2208,43 @@ func (e *Engine) reconcileRemote() error {
 					}
 					continue
 				}
+				// The "remote hash differs" signal is noisy. The stored hash is the
+				// MD5 of the *ciphertext* we uploaded, which is non-deterministic (a
+				// fresh random nonce per upload), and reconcile compares the store and
+				// the Drive listing as snapshots taken moments apart. So a file we are
+				// actively re-uploading locally can look like it "changed remotely"
+				// when it did not — which previously raised spurious conflicts and
+				// downloaded over live local data. Re-validate against fresh state and
+				// only proceed on a genuine external divergence.
+				fresh, ferr := e.store.GetSyncFile(e.ctx, e.pair.ID, tracked.LocalPath)
+				if ferr != nil || fresh == nil || fresh.RemoteHash == "" {
+					continue // can't confirm — never risk clobbering the local copy
+				}
+				// (a) Our own newer upload already caught up: the record now matches
+				//     the listing, so the earlier mismatch was just a stale snapshot.
+				if fresh.RemoteHash == rf.RemoteHash {
+					continue
+				}
+				// (b) An unsynced LOCAL change exists (or the file is mid-write): the
+				//     upload path owns this file. Pulling the remote would overwrite a
+				//     newer local version and, for a constantly-rewritten file, loop
+				//     forever. Let the upload reconcile the hashes instead.
+				lp := filepath.Join(e.pair.LocalDir, tracked.LocalPath)
+				if cur, herr := e.scanner.ComputeHash(lp); herr != nil || cur != fresh.LocalHash {
+					continue
+				}
+				// (c) The listing may itself be stale; confirm against the current
+				//     remote object. If Drive still matches our latest recorded upload,
+				//     nothing actually diverged.
+				if cf, cerr := e.driveClient.GetFile(e.ctx, rf.ID); cerr == nil && cf != nil && cf.MD5Hash == fresh.RemoteHash {
+					continue
+				}
 				sf := &models.SyncFile{
 					SyncRootID: e.pair.ID,
-					LocalPath:  tracked.LocalPath,
+					LocalPath:  fresh.LocalPath,
 					RemoteID:   rf.ID,
 					RemoteHash: rf.RemoteHash,
-					LocalHash:  tracked.LocalHash,
+					LocalHash:  fresh.LocalHash,
 					Size:       rf.Size,
 					ModTime:    rf.ModTime,
 				}
