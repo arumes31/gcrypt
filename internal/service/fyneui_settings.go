@@ -433,7 +433,12 @@ func (f *FyneApp) buildPairCard(pairID string) fyne.CanvasObject {
 			fyne.Do(func() { f.refreshPairs(); f.refresh() })
 		}()
 	})
-	enabledCheck.SetChecked(pair.Enabled)
+	// Set the initial state via the field, NOT SetChecked: SetChecked fires
+	// OnChanged, whose handler calls refreshPairs(), which rebuilds this row and
+	// calls SetChecked again — an infinite rebuild loop that spawns an AddPair
+	// goroutine each pass ("engine already exists" spam) and crashes the GUI.
+	// Assigning the field sets the visual state without invoking the callback.
+	enabledCheck.Checked = pair.Enabled
 
 	// Live per-folder stats + progress, updated in place by updatePairWidgets.
 	metrics := widget.NewLabel("")
@@ -464,7 +469,7 @@ func (f *FyneApp) buildPairCard(pairID string) fyne.CanvasObject {
 	if intervalVal <= 0 {
 		intervalVal = f.currentSyncInterval()
 	}
-	interval.SetSelected(labelForValue(intervalOptions, intervalVal))
+	interval.Selected = labelForValue(intervalOptions, intervalVal) // field, not SetSelected: avoid firing OnChanged on build
 	intervalRow := container.NewBorder(nil, nil, widget.NewLabel("Sync every"), nil, interval)
 
 	// Direction (two-way / upload-only / download-only / mirror).
@@ -479,7 +484,7 @@ func (f *FyneApp) buildPairCard(pairID string) fyne.CanvasObject {
 			_ = config.Save(config.ConfigPath(), c)
 		}
 	})
-	directionSel.SetSelected(labelByDirection[pair.EffectiveDirection()])
+	directionSel.Selected = labelByDirection[pair.EffectiveDirection()] // field, not SetSelected: avoid firing OnChanged on build
 	directionRow := container.NewBorder(nil, nil, widget.NewLabel("Direction"), nil, directionSel)
 
 	// Conflict resolution policy.
@@ -493,7 +498,7 @@ func (f *FyneApp) buildPairCard(pairID string) fyne.CanvasObject {
 			_ = config.Save(config.ConfigPath(), c)
 		}
 	})
-	conflictSel.SetSelected(labelByConflict[pair.EffectiveConflictPolicy()])
+	conflictSel.Selected = labelByConflict[pair.EffectiveConflictPolicy()] // field, not SetSelected: avoid firing OnChanged on build
 	conflictRow := container.NewBorder(nil, nil, widget.NewLabel("On conflict"), nil, conflictSel)
 
 	// On-demand (online-only) toggle.
@@ -507,7 +512,7 @@ func (f *FyneApp) buildPairCard(pairID string) fyne.CanvasObject {
 			_ = config.Save(config.ConfigPath(), c)
 		}
 	})
-	onlineOnly.SetChecked(pair.OnlineOnly)
+	onlineOnly.Checked = pair.OnlineOnly // field, not SetChecked: avoid firing OnChanged on build
 
 	// Filename length padding (set before first sync — toggling later renames
 	// every file on Drive).
@@ -521,7 +526,7 @@ func (f *FyneApp) buildPairCard(pairID string) fyne.CanvasObject {
 			_ = config.Save(config.ConfigPath(), c)
 		}
 	})
-	padNames.SetChecked(pair.PadFilenames)
+	padNames.Checked = pair.PadFilenames // field, not SetChecked: avoid firing OnChanged on build
 
 	// "Download online-only files" button, shown only when there are some.
 	onDemandRow := container.NewVBox(onlineOnly, padNames)
