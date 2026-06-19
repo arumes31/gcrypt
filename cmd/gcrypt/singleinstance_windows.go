@@ -8,6 +8,7 @@ import "golang.org/x/sys/windows"
 // process lifetime and released automatically by the OS on exit.
 const singleInstanceMutex = `gcrypt-single-instance-9c1f`
 
+//nolint:unused // intentionally held for the process lifetime; the OS releases it on exit
 var singleInstanceHandle windows.Handle
 
 // acquireSingleInstance reports whether this process may run. It returns false

@@ -218,8 +218,8 @@ func (w *Watcher) readDirectoryChanges(dir string) {
 		err := windows.ReadDirectoryChanges(
 			handle,
 			&buf[0],
-			uint32(len(buf)),
-			true, // watch subtree
+			uint32(len(buf)), // #nosec G115 -- buf is a fixed small buffer; its length always fits in uint32
+			true,             // watch subtree
 			notifyFilter,
 			&bytesReturned,
 			&overlapped,
@@ -291,15 +291,12 @@ func (w *Watcher) parseNotifyBuffer(buf []byte, watchDir string) {
 	var renameOldPath string
 
 	offset := 0
-	for {
-		if offset+12 > len(buf) {
-			break
-		}
+	for offset+12 <= len(buf) {
 
 		// Read the fixed header fields.
-		nextEntryOffset := *(*uint32)(unsafe.Pointer(&buf[offset]))
-		action := *(*uint32)(unsafe.Pointer(&buf[offset+4]))
-		fileNameLength := *(*uint32)(unsafe.Pointer(&buf[offset+8]))
+		nextEntryOffset := *(*uint32)(unsafe.Pointer(&buf[offset]))  // #nosec G103 -- parsing the FILE_NOTIFY_INFORMATION buffer returned by Win32
+		action := *(*uint32)(unsafe.Pointer(&buf[offset+4]))         // #nosec G103 -- parsing the FILE_NOTIFY_INFORMATION buffer returned by Win32
+		fileNameLength := *(*uint32)(unsafe.Pointer(&buf[offset+8])) // #nosec G103 -- parsing the FILE_NOTIFY_INFORMATION buffer returned by Win32
 
 		if offset+12+int(fileNameLength) > len(buf) {
 			break
@@ -309,7 +306,7 @@ func (w *Watcher) parseNotifyBuffer(buf []byte, watchDir string) {
 		fileNameBytes := buf[offset+12 : offset+12+int(fileNameLength)]
 		fileNameUTF16 := make([]uint16, fileNameLength/2)
 		for i := range fileNameUTF16 {
-			fileNameUTF16[i] = *(*uint16)(unsafe.Pointer(&fileNameBytes[i*2]))
+			fileNameUTF16[i] = *(*uint16)(unsafe.Pointer(&fileNameBytes[i*2])) // #nosec G103 -- decoding the UTF-16 filename from the Win32 notify buffer
 		}
 		fileName := string(utf16.Decode(fileNameUTF16))
 
@@ -470,4 +467,3 @@ func (w *Watcher) shouldIgnore(relPath string) bool {
 
 	return false
 }
-

@@ -44,7 +44,7 @@ func RunSetup(ctrl *AppController, logger *Logger) error {
 		// Fall back to a sensible default if the picker was dismissed.
 		syncDir = filepath.Join(os.Getenv("USERPROFILE"), "gcrypt")
 	}
-	if err := os.MkdirAll(syncDir, 0750); err != nil {
+	if err := os.MkdirAll(syncDir, 0750); err != nil { // #nosec G703 -- syncDir is user-chosen via the folder picker or a default under USERPROFILE
 		messageBox("gcrypt setup", fmt.Sprintf("Could not create sync folder:\n%v", err), mbOK|mbIconError)
 		return fmt.Errorf("service: creating sync dir: %w", err)
 	}
@@ -216,7 +216,7 @@ func runConnectExistingSetup(ctrl *AppController, logger *Logger) error {
 	}
 
 	// Read and validate the exported salt.
-	importedSalt, err := os.ReadFile(filepath.Join(srcDir, "salt.bin"))
+	importedSalt, err := os.ReadFile(filepath.Join(srcDir, "salt.bin")) // #nosec G304 -- srcDir is the import folder the user selected during setup
 	if err != nil {
 		messageBox("gcrypt setup",
 			"Could not read salt.bin from the selected folder.\nMake sure you copied it from the other PC.",
@@ -280,7 +280,7 @@ func runConnectExistingSetup(ctrl *AppController, logger *Logger) error {
 	if err := os.MkdirAll(filepath.Dir(saltPath), 0750); err != nil {
 		return fmt.Errorf("service: creating salt dir: %w", err)
 	}
-	if err := os.WriteFile(saltPath, importedSalt, 0600); err != nil {
+	if err := os.WriteFile(saltPath, importedSalt, 0600); err != nil { // #nosec G703 -- saltPath is the app's own salt.bin under %APPDATA%
 		return fmt.Errorf("service: saving salt: %w", err)
 	}
 
@@ -308,7 +308,7 @@ func runConnectExistingSetup(ctrl *AppController, logger *Logger) error {
 	if !ok || strings.TrimSpace(syncDir) == "" {
 		syncDir = filepath.Join(os.Getenv("USERPROFILE"), "gcrypt")
 	}
-	if err := os.MkdirAll(syncDir, 0750); err != nil {
+	if err := os.MkdirAll(syncDir, 0750); err != nil { // #nosec G703 -- syncDir is user-chosen via the folder picker or a default under USERPROFILE
 		messageBox("gcrypt setup", fmt.Sprintf("Could not create sync folder:\n%v", err), mbOK|mbIconError)
 		return fmt.Errorf("service: creating sync dir: %w", err)
 	}

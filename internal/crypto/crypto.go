@@ -474,7 +474,7 @@ func LockMemory(b []byte) error {
 		return nil
 	}
 	err := windows.VirtualLock(
-		uintptr(unsafe.Pointer(&b[0])),
+		uintptr(unsafe.Pointer(&b[0])), // #nosec G103 -- required Win32 syscall pointer marshalling
 		uintptr(len(b)),
 	)
 	if err != nil {
@@ -490,7 +490,7 @@ func UnlockMemory(b []byte) error {
 		return nil
 	}
 	err := windows.VirtualUnlock(
-		uintptr(unsafe.Pointer(&b[0])),
+		uintptr(unsafe.Pointer(&b[0])), // #nosec G103 -- required Win32 syscall pointer marshalling
 		uintptr(len(b)),
 	)
 	if err != nil {

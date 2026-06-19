@@ -304,21 +304,21 @@ func NewEngine(pair *config.SyncPair, appCfg *config.AppConfig, driveClient *dri
 	}
 
 	e := &Engine{
-		pair:          pair,
-		appCfg:        appCfg,
-		driveClient:   driveClient,
-		store:         store,
-		watcher:       watcher,
-		scanner:       scanner,
-		masterKey:     masterKey,
-		state:         StateIdle,
-		activeOps:     make(map[int]string),
-		folderCache:   make(map[string]string),
-		workQueue:     make(chan *models.SyncOperation, 1000),
-		errorCh:       make(chan error, 256),
-		stateChangeCh: make(chan SyncState, 64),
-		syncNowCh:     make(chan struct{}, 1),
-		OnError:       make(chan error, 64),
+		pair:           pair,
+		appCfg:         appCfg,
+		driveClient:    driveClient,
+		store:          store,
+		watcher:        watcher,
+		scanner:        scanner,
+		masterKey:      masterKey,
+		state:          StateIdle,
+		activeOps:      make(map[int]string),
+		folderCache:    make(map[string]string),
+		workQueue:      make(chan *models.SyncOperation, 1000),
+		errorCh:        make(chan error, 256),
+		stateChangeCh:  make(chan SyncState, 64),
+		syncNowCh:      make(chan struct{}, 1),
+		OnError:        make(chan error, 64),
 		maxRetries:     5,
 		workers:        workers,
 		rateLimiter:    time.NewTicker(time.Second / time.Duration(reqPerSec)),
@@ -538,7 +538,7 @@ func (e *Engine) notifyAppStateChange(oldState, newState appstate.State) {
 // to the rate at which workers drain the queue, keeping memory bounded even for
 // very large sync roots.
 func (e *Engine) scanAndEnqueue() error {
-	previousFiles, err := e.store.ListAll(e.pair.ID)
+	previousFiles, err := e.store.ListAll(e.ctx, e.pair.ID)
 	if err != nil {
 		return fmt.Errorf("list store: %w", err)
 	}
@@ -849,7 +849,7 @@ type ErroredFile struct {
 // ListErrored returns the pair's tracked files currently in the error state
 // (max retries exhausted). Best-effort: returns nil if the store can't be read.
 func (e *Engine) ListErrored() []ErroredFile {
-	files, err := e.store.ListAll(e.pair.ID)
+	files, err := e.store.ListAll(e.ctx, e.pair.ID)
 	if err != nil {
 		return nil
 	}
@@ -867,7 +867,7 @@ func (e *Engine) ListErrored() []ErroredFile {
 // the number of operations re-enqueued. It may block briefly applying queue
 // backpressure, so callers should not hold locks across it.
 func (e *Engine) RetryFailed() int {
-	files, err := e.store.ListAll(e.pair.ID)
+	files, err := e.store.ListAll(e.ctx, e.pair.ID)
 	if err != nil {
 		return 0
 	}
@@ -903,7 +903,7 @@ func (e *Engine) ResolveConflictAction(localPath string, action config.ConflictP
 		return fmt.Errorf("sync: no pending conflict for %s", localPath)
 	}
 
-	existing, err := e.store.GetSyncFile(e.pair.ID, localPath)
+	existing, err := e.store.GetSyncFile(e.ctx, e.pair.ID, localPath)
 	if err != nil || existing == nil {
 		return fmt.Errorf("sync: no store record for %s", localPath)
 	}
@@ -939,7 +939,7 @@ func (e *Engine) backupLocalConflictCopy(localPath string) {
 // OnlineOnlyCount returns how many online-only placeholder files this pair has
 // (tracked remote files that have not been downloaded).
 func (e *Engine) OnlineOnlyCount() int {
-	files, err := e.store.ListAll(e.pair.ID)
+	files, err := e.store.ListAll(e.ctx, e.pair.ID)
 	if err != nil {
 		return 0
 	}
@@ -956,7 +956,7 @@ func (e *Engine) OnlineOnlyCount() int {
 // this pair, materialising them on disk. Returns the number queued. May block
 // briefly on queue backpressure, so callers should not hold locks across it.
 func (e *Engine) MakeAvailableOffline() int {
-	files, err := e.store.ListAll(e.pair.ID)
+	files, err := e.store.ListAll(e.ctx, e.pair.ID)
 	if err != nil {
 		return 0
 	}
@@ -1137,7 +1137,7 @@ func (e *Engine) processEvents() {
 					continue
 				}
 				// Try to preserve existing remote ID from the store.
-				existing, err := e.store.GetSyncFile(e.pair.ID, ev.Path)
+				existing, err := e.store.GetSyncFile(e.ctx, e.pair.ID, ev.Path)
 				if err == nil && existing != nil {
 					// If the file is already recorded as synced with this exact
 					// content, the event carries no real change — most commonly
@@ -1156,7 +1156,7 @@ func (e *Engine) processEvents() {
 					LocalPath: ev.Path,
 				}
 				// Try to get the remote ID from the store.
-				existing, err := e.store.GetSyncFile(e.pair.ID, ev.Path)
+				existing, err := e.store.GetSyncFile(e.ctx, e.pair.ID, ev.Path)
 				if err == nil && existing != nil {
 					sf.RemoteID = existing.RemoteID
 				}
@@ -1167,7 +1167,7 @@ func (e *Engine) processEvents() {
 				oldSF := &models.SyncFile{
 					LocalPath: ev.OldPath,
 				}
-				existing, err := e.store.GetSyncFile(e.pair.ID, ev.OldPath)
+				existing, err := e.store.GetSyncFile(e.ctx, e.pair.ID, ev.OldPath)
 				if err == nil && existing != nil {
 					oldSF.RemoteID = existing.RemoteID
 				}
@@ -1342,7 +1342,7 @@ func (e *Engine) runWorker(id int) {
 					// Max retries exceeded — terminal failure. Mark the file as
 					// errored and clear it from the backlog.
 					if op.File != nil {
-						_ = e.store.UpdateStatus(e.pair.ID, op.File.LocalPath, models.SyncStatusError)
+						_ = e.store.UpdateStatus(e.ctx, e.pair.ID, op.File.LocalPath, models.SyncStatusError)
 					}
 					e.sendError(fmt.Errorf("sync: max retries exceeded for %s %s: %w",
 						op.OpType, op.File.LocalPath, err))
@@ -1487,7 +1487,7 @@ func (e *Engine) uploadFile(sf *models.SyncFile) error {
 			errCh <- err
 			return
 		}
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 
 		err = crypto.EncryptStream(f, pw, e.masterKey, sf.LocalPath)
 		_ = pw.CloseWithError(err) // nil → clean EOF; non-nil → reader aborts
@@ -1580,7 +1580,7 @@ func (e *Engine) uploadFile(sf *models.SyncFile) error {
 	if sf.Version == 0 {
 		sf.Version = 1
 	}
-	if err := e.store.PutSyncFile(sf); err != nil {
+	if err := e.store.PutSyncFile(e.ctx, sf); err != nil {
 		return fmt.Errorf("sync: record uploaded file %s: %w", sf.LocalPath, err)
 	}
 
@@ -1703,7 +1703,7 @@ func (e *Engine) downloadFile(sf *models.SyncFile) error {
 	if sf.Version == 0 {
 		sf.Version = 1
 	}
-	if err := e.store.PutSyncFile(sf); err != nil {
+	if err := e.store.PutSyncFile(e.ctx, sf); err != nil {
 		return fmt.Errorf("sync: record downloaded file %s: %w", sf.LocalPath, err)
 	}
 
@@ -1752,7 +1752,7 @@ func (e *Engine) deleteRemote(sf *models.SyncFile) error {
 	}
 
 	// 2. Delete from store.
-	if err := e.store.DeleteSyncFile(e.pair.ID, sf.LocalPath); err != nil {
+	if err := e.store.DeleteSyncFile(e.ctx, e.pair.ID, sf.LocalPath); err != nil {
 		return fmt.Errorf("sync: delete store record %s: %w", sf.LocalPath, err)
 	}
 
@@ -1801,7 +1801,7 @@ func (e *Engine) deleteLocal(sf *models.SyncFile) error {
 	}
 
 	// 2. Delete from store.
-	if err := e.store.DeleteSyncFile(e.pair.ID, sf.LocalPath); err != nil {
+	if err := e.store.DeleteSyncFile(e.ctx, e.pair.ID, sf.LocalPath); err != nil {
 		return fmt.Errorf("sync: delete store record %s: %w", sf.LocalPath, err)
 	}
 
@@ -1873,7 +1873,7 @@ func (e *Engine) resolveConflict(sf *models.SyncFile) error {
 			RemoteHash:    sf.RemoteHash,
 		})
 		// Mark as conflict in the store so the Issues view picks it up.
-		_ = e.store.UpdateStatus(e.pair.ID, sf.LocalPath, models.SyncStatusConflict)
+		_ = e.store.UpdateStatus(e.ctx, e.pair.ID, sf.LocalPath, models.SyncStatusConflict)
 		return nil
 
 	default: // auto (last-write-wins)
@@ -2013,7 +2013,7 @@ func (e *Engine) pollChanges() (relevant bool, newToken string, err error) {
 	folderIDs := e.knownFolderIDs()
 
 	tracked := make(map[string]struct{})
-	if files, lerr := e.store.ListAll(e.pair.ID); lerr == nil {
+	if files, lerr := e.store.ListAll(e.ctx, e.pair.ID); lerr == nil {
 		for _, sf := range files {
 			if sf.RemoteID != "" {
 				tracked[sf.RemoteID] = struct{}{}
@@ -2077,7 +2077,7 @@ func (e *Engine) reconcileRemote() error {
 	}
 
 	// Build a set of remote IDs currently tracked in the store.
-	trackedFiles, err := e.store.ListAll(e.pair.ID)
+	trackedFiles, err := e.store.ListAll(e.ctx, e.pair.ID)
 	if err != nil {
 		return fmt.Errorf("list store files: %w", err)
 	}
@@ -2121,7 +2121,7 @@ func (e *Engine) reconcileRemote() error {
 				}
 				if e.pair.OnlineOnly {
 					sf.SyncStatus = models.SyncStatusOnlineOnly
-					if perr := e.store.PutSyncFile(sf); perr != nil {
+					if perr := e.store.PutSyncFile(e.ctx, sf); perr != nil {
 						e.sendError(fmt.Errorf("sync: record online-only file %s: %w", sf.LocalPath, perr))
 					}
 					continue
@@ -2139,7 +2139,7 @@ func (e *Engine) reconcileRemote() error {
 					tracked.RemoteHash = rf.RemoteHash
 					tracked.Size = rf.Size
 					tracked.ModTime = rf.ModTime
-					if perr := e.store.PutSyncFile(tracked); perr != nil {
+					if perr := e.store.PutSyncFile(e.ctx, tracked); perr != nil {
 						e.sendError(fmt.Errorf("sync: update online-only file %s: %w", tracked.LocalPath, perr))
 					}
 					continue

@@ -16,12 +16,12 @@ const MinPassphraseLength = 12
 // the length bar but offer little protection. It is not exhaustive — it just
 // catches the most common mistakes.
 var commonWeakPassphrases = map[string]struct{}{
-	"password1234":    {},
+	"password1234":     {},
 	"passwordpassword": {},
-	"123456789012":    {},
-	"qwertyuiopas":    {},
-	"letmeinletmein":  {},
-	"gcryptgcrypt":    {},
+	"123456789012":     {},
+	"qwertyuiopas":     {},
+	"letmeinletmein":   {},
+	"gcryptgcrypt":     {},
 }
 
 // CheckPassphraseStrength validates a candidate master passphrase and returns a

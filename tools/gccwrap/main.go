@@ -12,6 +12,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"strings"
@@ -43,20 +44,20 @@ func main() {
 	if real == "" {
 		p, err := exec.LookPath("gcc")
 		if err != nil {
-			os.Stderr.WriteString("gccwrap: cannot find real gcc on PATH: " + err.Error() + "\n")
+			_, _ = os.Stderr.WriteString("gccwrap: cannot find real gcc on PATH: " + err.Error() + "\n")
 			os.Exit(1)
 		}
 		// Guard against recursion: if the wrapper was named gcc.exe and placed on
 		// PATH, LookPath("gcc") could resolve back to this binary. Refuse rather
 		// than fork-bomb.
 		if self, serr := os.Executable(); serr == nil && sameFile(self, p) {
-			os.Stderr.WriteString("gccwrap: refusing to invoke self (resolved gcc is this wrapper at " + p + "); set REAL_CC to the real gcc\n")
+			_, _ = os.Stderr.WriteString("gccwrap: refusing to invoke self (resolved gcc is this wrapper at " + p + "); set REAL_CC to the real gcc\n")
 			os.Exit(1)
 		}
 		real = p
 	}
 
-	cmd := exec.Command(real, args...)
+	cmd := exec.CommandContext(context.Background(), real, args...) // #nosec G204 G702 -- this wrapper exists precisely to forward args to the real gcc (REAL_CC/PATH)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -64,7 +65,7 @@ func main() {
 		if ee, ok := err.(*exec.ExitError); ok {
 			os.Exit(ee.ExitCode())
 		}
-		os.Stderr.WriteString("gccwrap: " + err.Error() + "\n")
+		_, _ = os.Stderr.WriteString("gccwrap: " + err.Error() + "\n")
 		os.Exit(1)
 	}
 }

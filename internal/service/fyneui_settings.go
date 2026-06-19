@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -563,7 +564,7 @@ func (f *FyneApp) buildPairCard(pairID string) fyne.CanvasObject {
 	})
 	openBtn := widget.NewButtonWithIcon("Open", theme.FolderOpenIcon(), func() {
 		if p := cfg.GetSyncPair(pairID); p != nil {
-			if err := exec.Command("explorer", p.LocalDir).Start(); err != nil {
+			if err := exec.CommandContext(context.Background(), "explorer", p.LocalDir).Start(); err != nil { // #nosec G204 -- fixed command; LocalDir is the pair's configured sync folder
 				fmt.Fprintf(os.Stderr, "service: open pair folder: %v\n", err)
 			}
 		}

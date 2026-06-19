@@ -36,7 +36,7 @@ func newBlob(d []byte) dataBlob {
 	if len(d) == 0 {
 		return dataBlob{}
 	}
-	return dataBlob{cbData: uint32(len(d)), pbData: &d[0]}
+	return dataBlob{cbData: uint32(len(d)), pbData: &d[0]} // #nosec G115 -- len(d) is a small in-memory secret blob, far below uint32 max
 }
 
 // bytes copies the blob's contents into a Go-managed slice.
@@ -45,7 +45,7 @@ func (b dataBlob) bytes() []byte {
 		return nil
 	}
 	out := make([]byte, b.cbData)
-	copy(out, unsafe.Slice(b.pbData, b.cbData))
+	copy(out, unsafe.Slice(b.pbData, b.cbData)) // #nosec G103 -- required to copy the DPAPI-allocated blob into Go memory
 	return out
 }
 
@@ -55,18 +55,18 @@ func protectData(plaintext []byte) ([]byte, error) {
 	var out dataBlob
 
 	ret, _, err := procProtect.Call(
-		uintptr(unsafe.Pointer(&in)),
-		0, // szDataDescr
-		0, // pOptionalEntropy
-		0, // pvReserved
-		0, // pPromptStruct
+		uintptr(unsafe.Pointer(&in)), // #nosec G103 -- required Win32 DPAPI syscall pointer marshalling
+		0,                            // szDataDescr
+		0,                            // pOptionalEntropy
+		0,                            // pvReserved
+		0,                            // pPromptStruct
 		cryptProtectUIForbidden,
-		uintptr(unsafe.Pointer(&out)),
+		uintptr(unsafe.Pointer(&out)), // #nosec G103 -- required Win32 DPAPI syscall pointer marshalling
 	)
 	if ret == 0 {
 		return nil, fmt.Errorf("service: CryptProtectData failed: %w", err)
 	}
-	defer func() { _, _, _ = procLocalFree.Call(uintptr(unsafe.Pointer(out.pbData))) }()
+	defer func() { _, _, _ = procLocalFree.Call(uintptr(unsafe.Pointer(out.pbData))) }() // #nosec G103 -- required Win32 syscall pointer marshalling
 
 	return out.bytes(), nil
 }
@@ -78,18 +78,18 @@ func unprotectData(ciphertext []byte) ([]byte, error) {
 	var out dataBlob
 
 	ret, _, err := procUnprotect.Call(
-		uintptr(unsafe.Pointer(&in)),
-		0, // ppszDataDescr
-		0, // pOptionalEntropy
-		0, // pvReserved
-		0, // pPromptStruct
+		uintptr(unsafe.Pointer(&in)), // #nosec G103 -- required Win32 DPAPI syscall pointer marshalling
+		0,                            // ppszDataDescr
+		0,                            // pOptionalEntropy
+		0,                            // pvReserved
+		0,                            // pPromptStruct
 		cryptProtectUIForbidden,
-		uintptr(unsafe.Pointer(&out)),
+		uintptr(unsafe.Pointer(&out)), // #nosec G103 -- required Win32 DPAPI syscall pointer marshalling
 	)
 	if ret == 0 {
 		return nil, fmt.Errorf("service: CryptUnprotectData failed: %w", err)
 	}
-	defer func() { _, _, _ = procLocalFree.Call(uintptr(unsafe.Pointer(out.pbData))) }()
+	defer func() { _, _, _ = procLocalFree.Call(uintptr(unsafe.Pointer(out.pbData))) }() // #nosec G103 -- required Win32 syscall pointer marshalling
 
 	return out.bytes(), nil
 }

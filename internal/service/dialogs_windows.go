@@ -122,7 +122,7 @@ type browseInfo struct {
 func messageBox(title, text string, flags uint32) int {
 	t, _ := syscall.UTF16PtrFromString(title)
 	m, _ := syscall.UTF16PtrFromString(text)
-	r, _, _ := pMessageBoxDlg.Call(0, uintptr(unsafe.Pointer(m)), uintptr(unsafe.Pointer(t)), uintptr(flags))
+	r, _, _ := pMessageBoxDlg.Call(0, uintptr(unsafe.Pointer(m)), uintptr(unsafe.Pointer(t)), uintptr(flags)) // #nosec G103 -- required Win32 syscall pointer marshalling
 	return int(r)
 }
 
@@ -146,14 +146,14 @@ func pickFolder(title string) (string, bool) {
 		}(),
 	}
 
-	pidl, _, _ := pSHBrowseForFolder.Call(uintptr(unsafe.Pointer(&bi)))
+	pidl, _, _ := pSHBrowseForFolder.Call(uintptr(unsafe.Pointer(&bi))) // #nosec G103 -- required Win32 syscall pointer marshalling
 	if pidl == 0 {
 		return "", false
 	}
 	defer func() { _, _, _ = pCoTaskMemFreeDlg.Call(pidl) }()
 
 	pathBuf := make([]uint16, 260)
-	ret, _, _ := pSHGetPathFromIDLst.Call(pidl, uintptr(unsafe.Pointer(&pathBuf[0])))
+	ret, _, _ := pSHGetPathFromIDLst.Call(pidl, uintptr(unsafe.Pointer(&pathBuf[0]))) // #nosec G103 -- required Win32 syscall pointer marshalling
 	if ret == 0 {
 		return "", false
 	}
@@ -195,7 +195,7 @@ func registerTextDlgClass() {
 			lpszClassName: textDlgClassName,
 		}
 		wc.cbSize = uint32(unsafe.Sizeof(wc))
-		_, _, _ = pRegisterClassExDlg.Call(uintptr(unsafe.Pointer(&wc)))
+		_, _, _ = pRegisterClassExDlg.Call(uintptr(unsafe.Pointer(&wc))) // #nosec G103 -- required Win32 syscall pointer marshalling
 	})
 }
 
@@ -235,7 +235,7 @@ func getControlText(hwnd uintptr) string {
 		return ""
 	}
 	buf := make([]uint16, length+1)
-	_, _, _ = pGetWindowTextDlg.Call(hwnd, uintptr(unsafe.Pointer(&buf[0])), uintptr(length+1))
+	_, _, _ = pGetWindowTextDlg.Call(hwnd, uintptr(unsafe.Pointer(&buf[0])), uintptr(length+1)) // #nosec G103 -- required Win32 syscall pointer marshalling
 	return syscall.UTF16ToString(buf)
 }
 
@@ -244,8 +244,8 @@ func createControl(class, text string, style uint32, x, y, w, h int, parent uint
 	textPtr, _ := syscall.UTF16PtrFromString(text)
 	hwnd, _, _ := pCreateWindowExDlg.Call(
 		0,
-		uintptr(unsafe.Pointer(classPtr)),
-		uintptr(unsafe.Pointer(textPtr)),
+		uintptr(unsafe.Pointer(classPtr)), // #nosec G103 -- required Win32 syscall pointer marshalling
+		uintptr(unsafe.Pointer(textPtr)),  // #nosec G103 -- required Win32 syscall pointer marshalling
 		uintptr(style),
 		uintptr(x), uintptr(y), uintptr(w), uintptr(h),
 		parent,
@@ -278,8 +278,8 @@ func promptText(title, label, initial string, password bool) (string, bool) {
 
 	hwnd, _, _ := pCreateWindowExDlg.Call(
 		wsExTopmost|wsExDlgFrame,
-		uintptr(unsafe.Pointer(textDlgClassName)),
-		uintptr(unsafe.Pointer(titlePtr)),
+		uintptr(unsafe.Pointer(textDlgClassName)), // #nosec G103 -- required Win32 syscall pointer marshalling
+		uintptr(unsafe.Pointer(titlePtr)),         // #nosec G103 -- required Win32 syscall pointer marshalling
 		wsOverlapped|wsCaption|wsSysMenu,
 		cwUseDefault, cwUseDefault, width, height,
 		0, 0, 0, 0,
@@ -313,15 +313,15 @@ func promptText(title, label, initial string, password bool) (string, bool) {
 	// Modal message loop.
 	var msg msgDlg
 	for {
-		r, _, _ := pGetMessageDlg.Call(uintptr(unsafe.Pointer(&msg)), 0, 0, 0)
-		if int32(r) <= 0 {
+		r, _, _ := pGetMessageDlg.Call(uintptr(unsafe.Pointer(&msg)), 0, 0, 0) // #nosec G103 -- required Win32 syscall pointer marshalling
+		if int32(r) <= 0 {                                                     // #nosec G115 -- GetMessage's documented return is -1/0/>0; int32 is the correct contract
 			break
 		}
 		// Let the dialog manager handle Tab/Enter/Esc navigation.
-		handled, _, _ := pIsDialogMessageDlg.Call(hwnd, uintptr(unsafe.Pointer(&msg)))
+		handled, _, _ := pIsDialogMessageDlg.Call(hwnd, uintptr(unsafe.Pointer(&msg))) // #nosec G103 -- required Win32 syscall pointer marshalling
 		if handled == 0 {
-			_, _, _ = pTranslateMsgDlg.Call(uintptr(unsafe.Pointer(&msg)))
-			_, _, _ = pDispatchMsgDlg.Call(uintptr(unsafe.Pointer(&msg)))
+			_, _, _ = pTranslateMsgDlg.Call(uintptr(unsafe.Pointer(&msg))) // #nosec G103 -- required Win32 syscall pointer marshalling
+			_, _, _ = pDispatchMsgDlg.Call(uintptr(unsafe.Pointer(&msg)))  // #nosec G103 -- required Win32 syscall pointer marshalling
 		}
 	}
 

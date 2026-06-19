@@ -8,13 +8,6 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// NLM_CONNECTIVITY flags (subset).
-const (
-	nlmConnectivityDisconnected = 0x0000
-	nlmConnectivityIPV4Internet = 0x0040
-	nlmConnectivityIPV6Internet = 0x0400
-)
-
 // NLM_CONNECTION_COST flags.
 const (
 	nlmConnectionCostUnknown      = 0x0000
@@ -26,8 +19,8 @@ const (
 )
 
 var (
-	modOle32                        = windows.NewLazySystemDLL("ole32.dll")
-	procCoCreateInstance             = modOle32.NewProc("CoCreateInstance")
+	modOle32             = windows.NewLazySystemDLL("ole32.dll")
+	procCoCreateInstance = modOle32.NewProc("CoCreateInstance")
 
 	modNlmAPI = windows.NewLazySystemDLL("nlmapi.dll") //nolint:unused // referenced via CLSID
 )
@@ -77,11 +70,11 @@ func IsMeteredNetwork() bool {
 
 	var pUnk unsafe.Pointer
 	hr, _, _ = procCoCreateInstance.Call(
-		uintptr(unsafe.Pointer(&clsidNetworkListManager)),
+		uintptr(unsafe.Pointer(&clsidNetworkListManager)), // #nosec G103 -- required Win32/COM syscall pointer marshalling
 		0,
 		1|4, // CLSCTX_INPROC_SERVER|CLSCTX_LOCAL_SERVER
-		uintptr(unsafe.Pointer(&iidNetworkCostManager)),
-		uintptr(unsafe.Pointer(&pUnk)),
+		uintptr(unsafe.Pointer(&iidNetworkCostManager)), // #nosec G103 -- required Win32/COM syscall pointer marshalling
+		uintptr(unsafe.Pointer(&pUnk)),                  // #nosec G103 -- required Win32/COM syscall pointer marshalling
 	)
 	if hr != 0 || pUnk == nil {
 		slog.Debug("metered: CoCreateInstance failed", "hr", hr)
@@ -95,7 +88,7 @@ func IsMeteredNetwork() bool {
 	}()
 
 	var cost uint32
-	hr, _, _ = syscall.SyscallN(mgr.vtbl.GetCost, uintptr(pUnk), uintptr(unsafe.Pointer(&cost)), 0)
+	hr, _, _ = syscall.SyscallN(mgr.vtbl.GetCost, uintptr(pUnk), uintptr(unsafe.Pointer(&cost)), 0) // #nosec G103 -- required Win32/COM syscall pointer marshalling
 	if hr != 0 {
 		slog.Debug("metered: GetCost failed", "hr", hr)
 		return false

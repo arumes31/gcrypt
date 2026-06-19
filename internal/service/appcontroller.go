@@ -247,7 +247,7 @@ func (ac *AppController) HandlePassphrase() error {
 	saltPath := filepath.Join(appDir, "gcrypt", "salt.bin")
 
 	var salt []byte
-	saltData, err := os.ReadFile(saltPath)
+	saltData, err := os.ReadFile(saltPath) // #nosec G304 -- saltPath is the app's own salt.bin under %APPDATA%, not user input
 	if err == nil {
 		salt = saltData
 		if len(salt) != 16 {
@@ -386,7 +386,7 @@ func (ac *AppController) TryAutoUnlock() bool {
 
 	// Load the salt (kept alongside the key; needed for later crypto ops).
 	saltPath := filepath.Join(appDataDir(), "gcrypt", "salt.bin")
-	salt, err := os.ReadFile(saltPath)
+	salt, err := os.ReadFile(saltPath) // #nosec G304 -- saltPath is the app's own salt.bin under %APPDATA%, not user input
 	if err != nil {
 		if ac.logger != nil {
 			ac.logger.Warn("auto-unlock failed to read salt", map[string]interface{}{
@@ -637,7 +637,7 @@ func (ac *AppController) StartSync() error {
 			LocalDir:      pair.LocalDir,
 			DriveFolderID: pair.DriveFolderID,
 		}
-		if err := store.UpsertSyncRoot(root); err != nil {
+		if err := store.UpsertSyncRoot(context.Background(), root); err != nil {
 			return fmt.Errorf("service: upsert sync root %s: %w", pair.ID, err)
 		}
 	}

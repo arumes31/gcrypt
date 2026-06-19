@@ -246,7 +246,7 @@ func (m *SyncManager) addPairLocked(pair *config.SyncPair, async bool) error {
 	m.engines[pair.ID] = engine
 
 	// Start per-engine error forwarding.
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(context.Background()) // #nosec G118 -- cancel is stored in m.engineCancels and invoked on stop/remove
 	m.engineCancels[pair.ID] = cancel
 	go m.forwardEngineErrors(ctx, pair.ID, engine)
 

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"io"
 	"os"
 	"os/exec"
@@ -112,7 +113,7 @@ func ensureWorkingOpenGL(log func(string, ...map[string]interface{})) (reexeced 
 
 	// Re-launch: the fresh process will load the just-staged Mesa opengl32.dll at
 	// startup and the GUI will render in software.
-	cmd := exec.Command(exe, os.Args[1:]...)
+	cmd := exec.CommandContext(context.Background(), exe, os.Args[1:]...) // #nosec G204 G702 -- re-launches this same executable with its own args
 	cmd.Env = os.Environ()
 	cmd.Stdout, cmd.Stderr, cmd.Stdin = os.Stdout, os.Stderr, os.Stdin
 	if err := cmd.Start(); err != nil {
@@ -143,17 +144,17 @@ func stageMesaBesideExe(mesaDir, exeDir string) error {
 }
 
 func copyFile(src, dst string) error {
-	in, err := os.Open(src)
+	in, err := os.Open(src) // #nosec G304 -- src is a bundled Mesa DLL path under the app dir, not user input
 	if err != nil {
 		return err
 	}
-	defer in.Close()
-	out, err := os.Create(dst)
+	defer func() { _ = in.Close() }()
+	out, err := os.Create(dst) // #nosec G304 -- dst is beside the executable, an app-controlled path
 	if err != nil {
 		return err
 	}
 	if _, err := io.Copy(out, in); err != nil {
-		out.Close()
+		_ = out.Close()
 		return err
 	}
 	return out.Close()
@@ -245,7 +246,7 @@ func probeHardwareOpenGL() (ok bool, known bool) {
 	const wsOverlapped = 0x00000000
 	hwnd, _, _ := createWindowExW.Call(
 		0,
-		uintptr(unsafe.Pointer(classStatic)),
+		uintptr(unsafe.Pointer(classStatic)), // #nosec G103 -- required Win32 syscall pointer marshalling
 		0,
 		wsOverlapped,
 		0, 0, 1, 1,
@@ -254,13 +255,13 @@ func probeHardwareOpenGL() (ok bool, known bool) {
 	if hwnd == 0 {
 		return false, false
 	}
-	defer destroyWindow.Call(hwnd)
+	defer func() { _, _, _ = destroyWindow.Call(hwnd) }()
 
 	hdc, _, _ := getDC.Call(hwnd)
 	if hdc == 0 {
 		return false, false
 	}
-	defer releaseDC.Call(hwnd, hdc)
+	defer func() { _, _, _ = releaseDC.Call(hwnd, hdc) }()
 
 	const (
 		pfdDrawToWindow = 0x00000004
@@ -276,7 +277,7 @@ func probeHardwareOpenGL() (ok bool, known bool) {
 		cDepthBits: 24,
 		iLayerType: 0, // PFD_MAIN_PLANE
 	}
-	pf, _, _ := choosePixelFormat.Call(hdc, uintptr(unsafe.Pointer(&pfd)))
+	pf, _, _ := choosePixelFormat.Call(hdc, uintptr(unsafe.Pointer(&pfd))) // #nosec G103 -- required Win32 syscall pointer marshalling
 	if pf == 0 {
 		// No OpenGL-capable pixel format at all -> definitely inadequate.
 		return false, true
@@ -287,7 +288,7 @@ func probeHardwareOpenGL() (ok bool, known bool) {
 	// which only supports OpenGL 1.1 — exactly what RDP exposes and far too old
 	// for Fyne. A hardware ICD reports neither flag.
 	var desc pixelFormatDescriptor
-	r, _, _ := describePixelFormat.Call(hdc, pf, unsafe.Sizeof(desc), uintptr(unsafe.Pointer(&desc)))
+	r, _, _ := describePixelFormat.Call(hdc, pf, unsafe.Sizeof(desc), uintptr(unsafe.Pointer(&desc))) // #nosec G103 -- required Win32 syscall pointer marshalling
 	if r == 0 {
 		return false, false // couldn't determine
 	}

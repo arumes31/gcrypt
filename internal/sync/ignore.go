@@ -225,7 +225,7 @@ func (im *IgnoreMatcher) matchDoubleStar(rel, pattern string, anchored, dirOnly 
 // LoadIgnoreFile reads a .gcrypt-ignore file and returns the list of
 // patterns. Empty lines and lines starting with # are skipped.
 func LoadIgnoreFile(path string) ([]string, error) {
-	f, err := os.Open(path)
+	f, err := os.Open(path) // #nosec G304 -- path is the .gcrypt-ignore file inside the configured sync root
 	if err != nil {
 		return nil, fmt.Errorf("open ignore file: %w", err)
 	}

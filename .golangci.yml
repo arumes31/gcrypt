@@ -1,21 +1,23 @@
+# golangci-lint v2 configuration.
+# `default: standard` enables errcheck, govet, ineffassign, staticcheck and
+# unused (staticcheck now subsumes the old gosimple). gofmt moved to the
+# separate `formatters` section in v2.
+version: "2"
+
 linters:
+  # gosec is intentionally NOT enabled here: it runs as its own dedicated CI step
+  # (securego/gosec), which honours gosec's native `//nosec` audit comments —
+  # golangci-lint's embedded gosec ignores those, so running it here too would
+  # double-report every audited line. golangci-lint covers everything else.
+  default: standard
   enable:
-    - gofmt
-    - govet
-    - errcheck
-    - staticcheck
-    - unused
-    - gosimple
-    - ineffassign
-    - typecheck
     - bodyclose
     - noctx
-    - gosec
 
 issues:
-  exclude-use-default: false
   max-issues-per-linter: 0
   max-same-issues: 0
 
-run:
-  timeout: 5m
+formatters:
+  enable:
+    - gofmt
