@@ -1,6 +1,6 @@
 module github.com/arumes31/gcrypt
 
-go 1.26.4
+go 1.26.6
 
 require (
 	fyne.io/fyne/v2 v2.7.4

@@ -197,7 +197,7 @@ oauth:
 ```
 
 #### Method B: Environment Variables
-If you prefer not to store credentials in your configuration file, you can set them as environment variables before starting `gcrypt`. This is especially useful for Docker container deployment or scripts:
+If you prefer not to store credentials in your configuration file, you can set them as environment variables before starting `gcrypt`. This is especially useful for Windows automation scripts:
 - **PowerShell / Windows Terminal**:
   ```powershell
   $env:GCRYPT_OAUTH_CLIENT_ID="your-client-id"
@@ -209,11 +209,6 @@ If you prefer not to store credentials in your configuration file, you can set t
   set GCRYPT_OAUTH_CLIENT_ID=your-client-id
   set GCRYPT_OAUTH_CLIENT_SECRET=your-client-secret
   gcrypt.exe
-  ```
-- **Linux / Docker** (if applicable):
-  ```bash
-  export GCRYPT_OAUTH_CLIENT_ID="your-client-id"
-  export GCRYPT_OAUTH_CLIENT_SECRET="your-client-secret"
   ```
 When these environment variables are set, they take precedence over config settings and bypass the credential prompt.
 
